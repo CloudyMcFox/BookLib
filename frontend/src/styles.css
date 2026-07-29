@@ -48,6 +48,38 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .books tr:nth-child(even) td{background:#fafbfc}
 .nowrap{white-space:nowrap}
 
+.olid-link{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#2563eb}
+.hint{color:#888;font-weight:400}
+.muted{color:#999;font-size:12px;font-style:italic}
+
+.tag{display:inline-block;background:#eef2ff;border:1px solid #dbe1fb;color:#334;border-radius:999px;padding:2px 8px;font-size:12px;line-height:1.5;white-space:nowrap}
+.tag.selectable{cursor:pointer}
+.tag.selectable:hover:not(:disabled){background:#e0e7ff}
+.tag.selected{background:#2563eb;border-color:#2563eb;color:#fff}
+.tag.more{cursor:pointer;background:#fff;border-style:dashed;color:#666;font-size:11px}
+.tag-count{opacity:.65;font-size:11px}
+.tag-list{display:flex;flex-wrap:wrap;gap:4px}
+.tags-cell{display:flex;flex-direction:column;gap:6px;min-width:150px;max-width:240px}
+.tags-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}
+
+.tag-filter{margin-top:10px;padding:8px;border:1px solid #e3e6ea;border-radius:6px;background:#fafbfc}
+.tag-filter-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:13px;color:#555;margin-bottom:6px}
+.tag-filter-head button{padding:2px 8px;font-size:12px}
+.tag-cloud{display:flex;flex-wrap:wrap;gap:5px;max-height:150px;overflow-y:auto}
+
+.books th.sortable{padding:0}
+.sort-btn{display:flex;align-items:center;gap:6px;width:100%;border:none;background:transparent;padding:8px;font-size:13px;font-weight:600;color:#333;border-radius:0}
+.sort-btn:hover:not(:disabled){background:#eceef2}
+.sort-btn.active{color:#2563eb}
+.sort-arrow{font-size:10px;color:#aaa}
+.sort-btn.active .sort-arrow{color:#2563eb}
+
+.cover-cell{display:flex;flex-direction:column;align-items:center;gap:6px;width:88px}
+.cover-thumb{width:72px;height:96px;object-fit:cover;border-radius:3px;background:#eee;border:1px solid #e3e6ea}
+.cover-thumb-empty{display:flex;align-items:center;justify-content:center;font-size:11px;color:#999;text-align:center}
+.cover-actions{display:flex;flex-direction:column;gap:4px;width:100%}
+.cover-actions button{padding:3px 6px;font-size:12px;width:100%}
+
 .snackbar{position:fixed;right:20px;bottom:20px;background:#222;color:#fff;padding:12px 14px;border-radius:6px;display:flex;gap:10px;align-items:center;z-index:50;font-size:14px}
 .snackbar button{background:transparent;border:1px solid #666;color:#fff}
 .snackbar button:hover{background:#333}
