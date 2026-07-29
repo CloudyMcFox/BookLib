@@ -235,16 +235,17 @@ def _is_english(langs) -> Optional[bool]:
 
 
 def _collect_isbns(obj) -> List[str]:
-    """Pull every ISBN we can find off an edition record (either shape)."""
+    """Pull every ISBN we can find off an edition record (either shape).
+    ISBN-13 first so it is the value shown and stored by default."""
     found: List[str] = []
     if not obj:
         return found
-    for field in ('isbn_10', 'isbn_13', 'isbn'):
+    for field in ('isbn_13', 'isbn_10', 'isbn'):
         vals = obj.get(field)
         if vals:
             found.extend(vals if isinstance(vals, list) else [vals])
     ids = obj.get('identifiers') or {}
-    for field in ('isbn_10', 'isbn_13', 'isbn'):
+    for field in ('isbn_13', 'isbn_10', 'isbn'):
         vals = ids.get(field)
         if vals:
             found.extend(vals if isinstance(vals, list) else [vals])
@@ -300,10 +301,10 @@ def _edition_title(entry: dict, detail: dict, fallback: Optional[str]) -> str:
         if not src:
             continue
         full = src.get('full_title')
-        if full:
+        if full and full.strip().lower() != 'untitled':
             return full
         title = src.get('title')
-        if title:
+        if title and title.strip().lower() != 'untitled':
             subtitle = src.get('subtitle')
             return f"{title}: {subtitle}" if subtitle else title
     return fallback or ''
@@ -391,6 +392,7 @@ def search_openlibrary(title: Optional[str] = None, author: Optional[str] = None
                     'publish_date': detail.get('publish_date') or entry.get('publish_date'),
                     'publishers': publishers,
                     'number_of_pages': detail.get('number_of_pages') or entry.get('number_of_pages'),
+                    'format': entry.get('physical_format') or detail.get('physical_format'),
                     'isbns': edition_isbns,
                     'language': 'eng' if english else ('unknown' if english is None else 'other'),
                     'cover': cover,

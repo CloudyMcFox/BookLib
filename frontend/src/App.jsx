@@ -200,16 +200,23 @@ function AddForm({onAdded}){
                 {(doc.editions && doc.editions.length>0) ? (
                   <>
                     <div className="edition-scroller">
-                      {((expandedSet[idx]) ? doc.editions : doc.editions.slice(0,6)).map((ed,ii)=> (
-                        <button key={ed.olid || ii} type="button" className="edition-card" onClick={()=>handleAddFromSearch(doc, (ed.isbns && ed.isbns[0]) || null, ed.olid)}>
-                          {ed.cover
-                            ? <img src={ed.cover} alt="cover" className="edition-cover"/>
-                            : <div className="edition-cover edition-cover-empty">No cover</div>}
-                          <div className="edition-title">{ed.title}</div>
-                          <div className="edition-meta">{ed.publish_date || ''}{ed.publishers && ed.publishers.length? ' — '+ed.publishers[0]: ''}</div>
-                          {ed.number_of_pages? <div className="edition-meta">{ed.number_of_pages} pages</div> : null}
-                        </button>
-                      ))}
+                      {((expandedSet[idx]) ? doc.editions : doc.editions.slice(0,6)).map((ed,ii)=> {
+                        const wanted = t(isbn).replace(/[-\s]/g,'')
+                        const match = wanted && (ed.isbns||[]).some(x=> String(x).replace(/[-\s]/g,'')===wanted)
+                        return (
+                          <button key={ed.olid || ii} type="button" className={match? 'edition-card match':'edition-card'} onClick={()=>handleAddFromSearch(doc, (ed.isbns && ed.isbns[0]) || null, ed.olid)}>
+                            {ed.cover
+                              ? <img src={ed.cover} alt="cover" className="edition-cover"/>
+                              : <div className="edition-cover edition-cover-empty">No cover</div>}
+                            <div className="edition-title">{ed.title}</div>
+                            <div className="edition-meta">{ed.publish_date || ''}{ed.publishers && ed.publishers.length? ' — '+ed.publishers[0]: ''}</div>
+                            <div className="edition-meta">{[ed.format, ed.number_of_pages? ed.number_of_pages+' pages':null].filter(Boolean).join(' — ')}</div>
+                            {(ed.isbns && ed.isbns.length)
+                              ? <div className="edition-isbn">ISBN {ed.isbns[0]}</div>
+                              : <div className="edition-isbn edition-isbn-none">No ISBN</div>}
+                          </button>
+                        )
+                      })}
                     </div>
                     {doc.editions.length>6 && (
                       <div style={{marginTop:6}}>
