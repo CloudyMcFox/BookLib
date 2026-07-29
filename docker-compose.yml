@@ -1,0 +1,24 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "${BACKEND_PORT:-8882}:8882"
+    volumes:
+      # Bind mount keeps books.db on the host so data survives rebuilds.
+      - ./backend:/app
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Empty = call the same origin the UI is served from (reverse proxy setup).
+        # Otherwise set VITE_API_BASE in .env, e.g. https://api.example.com
+        VITE_API_BASE: ${VITE_API_BASE:-}
+    ports:
+      - "${FRONTEND_PORT:-3006}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
