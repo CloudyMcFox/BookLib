@@ -92,6 +92,7 @@ function AddForm({onAdded}){
   const [author,setAuthor]=useState('')
   const [isbn,setIsbn]=useState('')
   const [olid,setOlid]=useState('')
+  const [googleId,setGoogleId]=useState('')
   const [notes,setNotes]=useState('')
   const [error,setError]=useState(null)
   const [loading,setLoading]=useState(false)
@@ -104,7 +105,7 @@ function AddForm({onAdded}){
   const submit=async e=>{
     if(e) e.preventDefault()
     setError(null)
-    const vals = {title: t(title), author: t(author), isbn: t(isbn), olid: t(olid), notes: t(notes)}
+    const vals = {title: t(title), author: t(author), isbn: t(isbn), olid: t(olid), google_id: t(googleId), notes: t(notes)}
     const missing = []
     if(!vals.title) missing.push('Title')
     if(!vals.author) missing.push('Author')
@@ -116,7 +117,7 @@ function AddForm({onAdded}){
       const res = await fetch(API_BASE + '/books',{method:'POST', headers: authHeaders(true), body: JSON.stringify(vals)})
       if(!res.ok){ setError(await readError(res)); return }
       const created = await res.json()
-      setTitle(''); setAuthor(''); setIsbn(''); setOlid(''); setNotes('')
+      setTitle(''); setAuthor(''); setIsbn(''); setOlid(''); setGoogleId(''); setNotes('')
       setSearchResults([])
       onAdded(created)
     }catch(err){
@@ -133,16 +134,30 @@ function AddForm({onAdded}){
       const res = await fetch(API_BASE + '/lookup/' + encodeURIComponent(isbnVal), {headers: authHeaders()})
       if(!res.ok){ setError('Lookup failed'); setLoading(false); return }
       const j = await res.json()
-      if(j.title) setTitle(j.title)
-      if(j.authors && j.authors.length) setAuthor(j.authors.join(', '))
+      const foundTitle = j.title || ''
+      const foundAuthor = (j.authors && j.authors.length) ? j.authors.join(', ') : ''
+      if(foundTitle) setTitle(foundTitle)
+      if(foundAuthor) setAuthor(foundAuthor)
       if(j.olid) setOlid(j.olid)
-      if(!j.title && (!j.authors || !j.authors.length) && !j.olid) setError('No data found')
+      if(j.google_id) setGoogleId(j.google_id)
+      if(!foundTitle && !foundAuthor && !j.olid){ setError('No data found'); setLoading(false); return }
+      setLoading(false)
+      // Chain straight into the edition search: the point of a lookup is almost
+      // always to then pick the right edition, and the ISBN we just resolved
+      // highlights the matching one. Search on what the lookup returned rather
+      // than on the form, so a lookup that only resolves an OLID cannot search
+      // using the previous book's title and quietly return the wrong editions.
+      if(foundTitle || foundAuthor){
+        await searchMeta(undefined, {title: foundTitle, author: foundAuthor})
+      }
+      return
     }catch(err){ setError(err.message) }
     setLoading(false)
   }
 
-  const searchMeta = async (includeAll)=>{
-    const titleVal = t(title), authorVal = t(author)
+  const searchMeta = async (includeAll, overrides)=>{
+    const titleVal = t(overrides && overrides.title !== undefined ? overrides.title : title)
+    const authorVal = t(overrides && overrides.author !== undefined ? overrides.author : author)
     if(!titleVal && !authorVal){ setError('Enter title or author to search'); return }
     const all = includeAll===undefined ? allLanguages : includeAll
     setError(null); setSearching(true); setSearchResults([])
@@ -156,12 +171,12 @@ function AddForm({onAdded}){
       if(!res.ok){ setError('Search failed'); setSearching(false); return }
       const j = await res.json()
       setSearchResults(j)
-      if(j.length===0) setError('No matching books found on OpenLibrary')
+      if(j.length===0) setError('No matching books found on OpenLibrary or Google Books')
     }catch(err){ setError(err.message) }
     setSearching(false)
   }
 
-  const handleAddFromSearch = async (doc, isbnVal, olidVal, coverVal) =>{
+  const handleAddFromSearch = async (doc, isbnVal, olidVal, coverVal, googleVal) =>{
     let details = null
     try{
       if(olidVal){
@@ -179,7 +194,7 @@ function AddForm({onAdded}){
     const display = `${titleVal}${authorsVal? ' — ' + authorsVal: ''}${pub? ' ('+pub+')':''}`
     if(!confirm('Add this edition to your library?\n\n' + display)) return
 
-    const payload = { title: titleVal, author: authorsVal, isbn: t(isbnVal || (details && details.isbns && details.isbns[0])), olid: olidVal || null, notes: '', cover_url: coverVal || null }
+    const payload = { title: titleVal, author: authorsVal, isbn: t(isbnVal || (details && details.isbns && details.isbns[0])), olid: olidVal || null, google_id: googleVal || (details && details.google_id) || null, notes: '', cover_url: coverVal || null }
     try{
       const r = await fetch(API_BASE + '/books', {method: 'POST', headers: authHeaders(true), body: JSON.stringify(payload)})
       if(!r.ok){ setError(await readError(r)); return }
@@ -198,7 +213,7 @@ function AddForm({onAdded}){
         <label>Title<input value={title} onChange={e=>setTitle(e.target.value)}/></label>
         <label>Author<input value={author} onChange={e=>setAuthor(e.target.value)}/></label>
         <div style={{margin:'8px 0',display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
-          <button type="submit" className="primary" disabled={searching}>{searching? 'Searching...':'Search editions'}</button>
+          <button type="submit" className="primary" disabled={searching || loading}>{searching? 'Searching...':'Search editions'}</button>
           <label className="inline-check">
             <input type="checkbox" checked={allLanguages} onChange={e=>{ setAllLanguages(e.target.checked); if(searchResults.length) searchMeta(e.target.checked) }} />
             Include translations
@@ -212,6 +227,9 @@ function AddForm({onAdded}){
         </label>
         <label>OLID <span className="hint">(optional — filled in automatically when you add from search)</span>
           <input value={olid} placeholder="OL12345M" onChange={e=>setOlid(e.target.value)}/>
+        </label>
+        <label>Google ID <span className="hint">(optional — makes later lookups faster and exact)</span>
+          <input value={googleId} placeholder="otCEEQAAQBAJ" onChange={e=>setGoogleId(e.target.value)}/>
         </label>
         <label>Notes<input value={notes} onChange={e=>setNotes(e.target.value)}/></label>
         <div style={{marginTop:8}}>
@@ -227,7 +245,10 @@ function AddForm({onAdded}){
               <div style={{fontWeight:600}}>{doc.title} {doc.publish_year? `(${doc.publish_year})`: ''}</div>
               <div style={{fontSize:13,color:'#444'}}>{(doc.authors||[]).join(', ')}</div>
               <div style={{marginTop:6,minWidth:0}}>
-                <div style={{fontSize:13,color:'#666'}}>Editions:</div>
+                <div style={{fontSize:13,color:'#666'}}>
+                  Editions:
+                  {doc.source==='google' && <span className="source-badge">via Google Books</span>}
+                </div>
                 {(doc.editions && doc.editions.length>0) ? (
                   <>
                     <div className="edition-scroller">
@@ -235,7 +256,7 @@ function AddForm({onAdded}){
                         const wanted = t(isbn).replace(/[-\s]/g,'')
                         const match = wanted && (ed.isbns||[]).some(x=> String(x).replace(/[-\s]/g,'')===wanted)
                         return (
-                          <button key={ed.olid || ii} type="button" className={match? 'edition-card match':'edition-card'} onClick={()=>handleAddFromSearch(doc, (ed.isbns && ed.isbns[0]) || null, ed.olid, ed.cover)}>
+                          <button key={ed.olid || ed.isbns?.[0] || ii} type="button" className={match? 'edition-card match':'edition-card'} onClick={()=>handleAddFromSearch(doc, (ed.isbns && ed.isbns[0]) || null, ed.olid, ed.cover, ed.google_id)}>
                             {ed.cover
                               ? <img src={ed.cover} alt="cover" className="edition-cover"/>
                               : <div className="edition-cover edition-cover-empty">No cover</div>}
@@ -421,35 +442,48 @@ function TagsCell({book, onChanged, onError}){
             )}
           </div>
         : <span className="muted">No tags</span>}
-      <button type="button" onClick={lookup} disabled={busy || (!book.isbn && !book.olid)}
-              title={(book.isbn || book.olid) ? 'Fetch genres from OpenLibrary' : 'Add an ISBN or OLID first'}>
+      <button type="button" onClick={lookup} disabled={busy}
+              title="Fetch genres from OpenLibrary or Google Books">
         {busy ? '...' : (tags.length ? 'Refresh tags' : 'Lookup tags')}
       </button>
     </div>
   )
 }
 
-function OlidCell({book, onChanged, onError}){
-  const [busy,setBusy]=useState(false)
+function SourcesCell({book, onChanged, onError}){
+  const [busy,setBusy]=useState(null)
 
-  const lookup = async ()=>{
-    setBusy(true); onError(null)
+  const lookup = async (kind)=>{
+    setBusy(kind); onError(null)
     try{
-      const res = await fetch(API_BASE + '/books/' + book.id + '/olid/lookup', {method:'POST', headers: authHeaders()})
+      const res = await fetch(`${API_BASE}/books/${book.id}/${kind}/lookup`, {method:'POST', headers: authHeaders()})
       if(!res.ok){ onError(await readError(res)) }
       else if(onChanged) onChanged(await res.json())
     }catch(err){ onError(friendlyMessage(err.message)) }
-    setBusy(false)
+    setBusy(null)
   }
 
-  if(book.olid){
-    return <a className="olid-link" href={`https://openlibrary.org/books/${book.olid}`} target="_blank" rel="noreferrer">{book.olid}</a>
-  }
   return (
-    <button type="button" onClick={lookup} disabled={busy || !book.isbn}
-            title={book.isbn ? 'Look up the OpenLibrary edition id from the ISBN' : 'Add an ISBN first'}>
-      {busy ? '...' : 'Lookup'}
-    </button>
+    <div className="sources-cell">
+      <div className="source-row">
+        <span className="source-label">OL</span>
+        {book.olid
+          ? <a className="source-link" href={`https://openlibrary.org/books/${book.olid}`} target="_blank" rel="noreferrer" title={book.olid}>{book.olid}</a>
+          : <button type="button" onClick={()=>lookup('olid')} disabled={!!busy || !book.isbn}
+                    title={book.isbn ? 'Look up the OpenLibrary edition id from the ISBN' : 'Add an ISBN first'}>
+              {busy==='olid' ? '...' : 'Lookup'}
+            </button>}
+      </div>
+      <div className="source-row">
+        <span className="source-label">GB</span>
+        {book.google_id
+          ? <a className="source-link" href={`https://books.google.com/books?id=${book.google_id}`} target="_blank" rel="noreferrer" title={book.google_id}>{book.google_id}</a>
+          : <button type="button" onClick={()=>lookup('google')} disabled={!!busy || (!book.isbn && !book.title)}
+                    title="Look up the Google Books volume id">
+              {busy==='google' ? '...' : 'Lookup'}
+            </button>}
+      </div>
+    </div>
   )
 }
 
@@ -468,24 +502,26 @@ function SortHeader({label, field, sort, onSort}){
 
 function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort}){
   const [editingId, setEditingId] = useState(null)
-  const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', notes:'', tags:'', added:'', addedOriginal:''})
+  const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', added:'', addedOriginal:''})
   const [rowError, setRowError] = useState(null)
 
   const startEdit = (b)=>{
     setRowError(null)
     setEditingId(b.id)
     const added = toDateInput(b.created_at)
-    setEditVals({title: b.title||'', author: b.author||'', isbn: b.isbn||'', olid: b.olid||'', notes: b.notes||'', tags: (b.tags||[]).join(', '), added, addedOriginal: added})
+    setEditVals({title: b.title||'', author: b.author||'', isbn: b.isbn||'', olid: b.olid||'', googleId: b.google_id||'', notes: b.notes||'', tags: (b.tags||[]).join(', '), added, addedOriginal: added})
   }
-  const cancelEdit = ()=>{ setEditingId(null); setRowError(null); setEditVals({title:'', author:'', isbn:'', olid:'', notes:'', tags:'', added:'', addedOriginal:''}) }
+  const cancelEdit = ()=>{ setEditingId(null); setRowError(null); setEditVals({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', added:'', addedOriginal:''}) }
 
   const saveEdit = async (book)=>{
     setRowError(null)
-    const vals = {title: t(editVals.title), author: t(editVals.author), isbn: t(editVals.isbn), olid: t(editVals.olid), notes: t(editVals.notes),
+    const vals = {title: t(editVals.title), author: t(editVals.author), isbn: t(editVals.isbn), olid: t(editVals.olid),
+                  google_id: t(editVals.googleId), notes: t(editVals.notes),
                   tags: editVals.tags.split(',').map(t).filter(Boolean)}
     if(!vals.title){ setRowError('Title is required'); return }
     if(vals.isbn && !validateISBN(vals.isbn)){ setRowError('ISBN must be 10 or 13 digits'); return }
     if(vals.olid && !/^OL\d+M$/i.test(vals.olid)){ setRowError('OLID must look like OL12345M'); return }
+    if(vals.google_id && !/^[A-Za-z0-9_-]{8,40}$/.test(vals.google_id)){ setRowError('Google ID must look like otCEEQAAQBAJ'); return }
     // Only send the added date when it was actually changed, so an untouched row
     // keeps the time-of-day part of its original timestamp.
     if(editVals.added !== editVals.addedOriginal){
@@ -514,9 +550,9 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
           <SortHeader label="Title" field="title" sort={sort} onSort={onSort} />
           <SortHeader label="Author" field="author" sort={sort} onSort={onSort} />
           <th>ISBN</th>
-          <th>OLID</th>
+          <th>Sources</th>
           <th>Tags</th>
-          <th>Notes</th>
+          <th className="col-notes">Notes</th>
           <SortHeader label="Added" field="added" sort={sort} onSort={onSort} />
           <th></th>
         </tr></thead>
@@ -529,9 +565,12 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   <td><input value={editVals.title} onChange={e=>setEditVals({...editVals, title: e.target.value})} /></td>
                   <td><input value={editVals.author} onChange={e=>setEditVals({...editVals, author: e.target.value})} /></td>
                   <td><input value={editVals.isbn} onChange={e=>setEditVals({...editVals, isbn: e.target.value})} /></td>
-                  <td><input value={editVals.olid} placeholder="OL12345M" onChange={e=>setEditVals({...editVals, olid: e.target.value})} /></td>
+                  <td>
+                    <input value={editVals.olid} placeholder="OL12345M" onChange={e=>setEditVals({...editVals, olid: e.target.value})} />
+                    <input style={{marginTop:4}} value={editVals.googleId} placeholder="otCEEQAAQBAJ" onChange={e=>setEditVals({...editVals, googleId: e.target.value})} />
+                  </td>
                   <td><input value={editVals.tags} placeholder="comma, separated, tags" onChange={e=>setEditVals({...editVals, tags: e.target.value})} /></td>
-                  <td><input value={editVals.notes} onChange={e=>setEditVals({...editVals, notes: e.target.value})} /></td>
+                  <td className="col-notes"><input value={editVals.notes} onChange={e=>setEditVals({...editVals, notes: e.target.value})} /></td>
                   <td><input type="date" value={editVals.added} onChange={e=>setEditVals({...editVals, added: e.target.value})} /></td>
                   <td className="nowrap">
                     <button onClick={()=>saveEdit(b)}>Save</button>
@@ -540,12 +579,12 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                 </>
               ) : (
                 <>
-                  <td>{b.title}</td>
-                  <td>{b.author}</td>
+                  <td className="col-title">{b.title}</td>
+                  <td className="col-author">{b.author}</td>
                   <td>{b.isbn}</td>
-                  <td className="nowrap"><OlidCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
+                  <td><SourcesCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
                   <td><TagsCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
-                  <td>{b.notes}</td>
+                  <td className="col-notes">{b.notes}</td>
                   <td className="nowrap">{formatAdded(b.created_at)}</td>
                   <td className="nowrap">
                     <button onClick={()=>startEdit(b)}>Edit</button>
@@ -659,13 +698,13 @@ export default function App(){
     if(!undo) return
     try{
       if(undo.type==='delete'){
-        const res = await fetch(API_BASE + '/books', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
+        const res = await fetch(API_BASE + '/books', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
         if(res.ok){
           const restored = await res.json()
           if(undo.wasRecent) setRecent(prev=> sortNewestFirst([restored, ...prev]))
         }
       } else if(undo.type==='update'){
-        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
+        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
         if(res.ok){
           const reverted = await res.json()
           setRecent(prev=> prev.map(x=> x.id===reverted.id ? reverted : x))
@@ -716,7 +755,7 @@ export default function App(){
   const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]) }
 
   return (
-    <div className="container">
+    <div className={loggedIn ? 'container wide' : 'container'}>
       <div className="header">
         <h1>Book Library</h1>
         {loggedIn && <button onClick={logout}>Logout</button>}

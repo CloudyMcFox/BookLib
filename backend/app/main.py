@@ -20,6 +20,13 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-to-a-secure-random-string")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 8))
 
+# Google Books is used as a fallback when OpenLibrary has no genres, cover or
+# metadata for a book. An API key is optional but strongly recommended: without
+# one Google shares a per-IP anonymous quota that is regularly exhausted, and
+# calls simply start returning HTTP 429.
+GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "").strip()
+GOOGLE_BOOKS_ENABLED = os.environ.get("GOOGLE_BOOKS_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
@@ -59,6 +66,27 @@ def clean_olid(value: Optional[str]) -> Optional[str]:
     return m.group(0) if m else None
 
 
+def clean_google_id(value: Optional[str]) -> Optional[str]:
+    """Normalise a Google Books volume id.
+
+    Accepts a bare id ('otCEEQAAQBAJ') or any of the URLs it appears in:
+      https://books.google.com/books?id=otCEEQAAQBAJ
+      https://www.google.com/books/edition/Songs_of_the_Dead/otCEEQAAQBAJ
+      https://www.googleapis.com/books/v1/volumes/otCEEQAAQBAJ
+    Returns None when nothing id-shaped is present."""
+    v = clean(value)
+    if not v:
+        return None
+    m = re.search(r'[?&]id=([A-Za-z0-9_-]+)', v)
+    if m:
+        return m.group(1)
+    if '/' in v:
+        # Last non-empty path segment, e.g. .../edition/Title/<id>
+        segments = [s for s in v.split('?')[0].split('/') if s]
+        v = segments[-1] if segments else v
+    return v if re.fullmatch(r'[A-Za-z0-9_-]{8,40}', v) else None
+
+
 TIMESTAMP_FORMATS = ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d')
 
 
@@ -85,6 +113,9 @@ class Book(BaseModel):
     # OpenLibrary edition id (e.g. OL12345M). Populated when adding from search
     # results; optional for manual entries.
     olid: Optional[str] = None
+    # Google Books volume id (e.g. otCEEQAAQBAJ). Lets a lookup go straight to
+    # the volume record instead of searching for it first.
+    google_id: Optional[str] = None
     notes: Optional[str] = None
     # Omit on PUT to leave a book's tags untouched; send a list to replace them.
     tags: Optional[List[str]] = None
@@ -163,10 +194,12 @@ if 'olid' not in _existing_cols:
             continue
         remaining = re.sub(r'OLID:\s*' + m.group(0), '', row['notes']).strip(' ,;')
         conn.execute("UPDATE books SET olid=?, notes=? WHERE id=?", (m.group(0), remaining or None, row['id']))
+if 'google_id' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN google_id TEXT")
 conn.commit()
 
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
-BOOK_COLUMNS = "id, title, author, isbn, olid, notes, created_at, length(cover) AS cover_size"
+BOOK_COLUMNS = "id, title, author, isbn, olid, google_id, notes, created_at, length(cover) AS cover_size"
 
 # Whitelisted ORDER BY clauses, so the sort parameter can never be injected.
 # Books added before created_at existed sort by id, which preserves insert order.
@@ -199,7 +232,7 @@ SUBJECT_JUNK = re.compile(
     r'^(nyt|award|lc|ddc|bic|bisac|series?)\s*:|\d{4}|accessible book|protected daisy'
     r'|in library|overdrive|large type|new york times|bestseller|reviewed'
     r'|internet archive|open library|lending|wishlist|translations'
-    r'|reading level|specimens|manual for civilization', re.I)
+    r'|reading level|specimens|manual for civilization|electronic books', re.I)
 # BISAC strings end in a filler segment we do not want as a tag.
 DROP_SEGMENTS = {'general', 'other', 'miscellaneous'}
 # Curated vocabulary used when a book has no BISAC-style subjects: the matched
@@ -276,10 +309,17 @@ def extract_genres(subjects) -> List[str]:
                         push(label)
                         break
 
-    result = out[:MAX_LOOKUP_TAGS]
+    return _derive_extra_genres(out[:MAX_LOOKUP_TAGS])
+
+
+def _derive_extra_genres(genres: List[str]) -> List[str]:
+    """Add genres implied by a combination rather than stated outright.
+    Applied after merging sources, so a Fantasy from one and a Romance from the
+    other still produce Romantasy."""
+    result = list(genres)
+    lowered = {t.lower() for t in result}
     # OpenLibrary barely uses the 'romantasy' subject, so derive it: a book
     # tagged both Fantasy and Romance is the genre by definition.
-    lowered = {t.lower() for t in result}
     if 'fantasy' in lowered and 'romance' in lowered and 'romantasy' not in lowered:
         result.append('Romantasy')
     return result
@@ -457,6 +497,257 @@ def _download_image(url: str) -> Optional[tuple]:
     return content, mime
 
 
+# --- Google Books fallback ---
+GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
+# Largest first: only smallThumbnail/thumbnail are always present, the rest turn
+# up on better catalogued volumes.
+GOOGLE_IMAGE_SIZES = ('extraLarge', 'large', 'medium', 'small', 'thumbnail', 'smallThumbnail')
+_GOOGLE_CACHE: dict = {}
+_GOOGLE_CACHE_TTL = 600
+_GOOGLE_CACHE_MAX = 256
+
+
+def _google_volume_item(isbn: Optional[str]) -> Optional[dict]:
+    """Look a book up on Google Books by ISBN and return the whole search item,
+    which carries the volume id as well as its volumeInfo.
+
+    Adding a book can ask for genres, a cover and metadata in one request, so
+    results are cached briefly to keep that to a single call. A None result is
+    cached too, otherwise a book Google does not know about would be retried on
+    every lookup."""
+    if not GOOGLE_BOOKS_ENABLED:
+        return None
+    cleaned = re.sub(r'[^0-9Xx]', '', isbn or '')
+    if not cleaned:
+        return None
+
+    cached = _GOOGLE_CACHE.get(cleaned)
+    if cached and (datetime.utcnow() - cached[0]).total_seconds() < _GOOGLE_CACHE_TTL:
+        return cached[1]
+
+    params = {'q': f'isbn:{cleaned}', 'maxResults': 1, 'country': 'US'}
+    if GOOGLE_BOOKS_API_KEY:
+        params['key'] = GOOGLE_BOOKS_API_KEY
+
+    item: Optional[dict] = None
+    try:
+        r = requests.get(GOOGLE_BOOKS_URL, params=params, timeout=8)
+        if r.status_code == 200:
+            items = r.json().get('items') or []
+            if items:
+                item = items[0]
+    except (requests.RequestException, ValueError):
+        item = None
+
+    if len(_GOOGLE_CACHE) >= _GOOGLE_CACHE_MAX:
+        _GOOGLE_CACHE.clear()
+    _GOOGLE_CACHE[cleaned] = (datetime.utcnow(), item)
+    return item
+
+
+def _google_volume(isbn: Optional[str]) -> Optional[dict]:
+    """The volumeInfo for an ISBN, or None."""
+    return (_google_volume_item(isbn) or {}).get('volumeInfo')
+
+
+def _google_volume_detail(volume_id: Optional[str]) -> Optional[dict]:
+    """Fetch a single volume by id and return its volumeInfo.
+
+    This matters for genres: the search endpoint returns an abbreviated record
+    whose `categories` are collapsed to one top-level subject ("Fiction"),
+    while the per-volume record carries the full BISAC list ("Fiction / Fantasy
+    / Urban", ...). Same book, same API, different amount of detail."""
+    if not GOOGLE_BOOKS_ENABLED or not volume_id:
+        return None
+
+    cache_key = f"volume:{volume_id}"
+    cached = _GOOGLE_CACHE.get(cache_key)
+    if cached and (datetime.utcnow() - cached[0]).total_seconds() < _GOOGLE_CACHE_TTL:
+        return cached[1]
+
+    params = {'country': 'US'}
+    if GOOGLE_BOOKS_API_KEY:
+        params['key'] = GOOGLE_BOOKS_API_KEY
+
+    info: Optional[dict] = None
+    try:
+        r = requests.get(f"{GOOGLE_BOOKS_URL}/{volume_id}", params=params, timeout=8)
+        if r.status_code == 200:
+            info = r.json().get('volumeInfo') or None
+    except (requests.RequestException, ValueError):
+        info = None
+
+    if len(_GOOGLE_CACHE) >= _GOOGLE_CACHE_MAX:
+        _GOOGLE_CACHE.clear()
+    _GOOGLE_CACHE[cache_key] = (datetime.utcnow(), info)
+    return info
+
+
+def _google_categories_for(item: Optional[dict]) -> List[str]:
+    """Categories for a search item, preferring the fuller per-volume record."""
+    if not item:
+        return []
+    detail = _google_volume_detail(item.get('id'))
+    detailed = (detail or {}).get('categories') or []
+    if detailed:
+        return detailed
+    return (item.get('volumeInfo') or {}).get('categories') or []
+
+
+def _google_item_for(isbn: Optional[str], google_id: Optional[str] = None) -> Optional[dict]:
+    """The Google search-item shape for a book, preferring a stored volume id.
+
+    A known id turns two requests into one and removes the guesswork: the ISBN
+    search can miss, or match a different edition. Falls back to the ISBN search
+    when there is no id, or when the id no longer resolves."""
+    volume_id = clean_google_id(google_id)
+    if volume_id:
+        detail = _google_volume_detail(volume_id)
+        if detail:
+            return {'id': volume_id, 'volumeInfo': detail}
+    return _google_volume_item(isbn)
+
+
+def _clean_google_image_url(raw: str) -> str:
+    """Google hands back http:// links, and its thumbnails carry a page-curl
+    effect we do not want burned into a stored cover. `edge=curl` may appear as
+    either the first or a later query parameter, so strip it as a parameter
+    rather than by string match."""
+    url = raw.strip().replace('http://', 'https://')
+    url = re.sub(r'[?&]edge=curl\b', lambda m: '?' if m.group(0)[0] == '?' else '', url)
+    return url.rstrip('?&')
+
+
+def _google_cover_urls(isbn: Optional[str], google_id: Optional[str] = None) -> List[str]:
+    """Cover URLs from Google Books, largest first."""
+    item = _google_item_for(isbn, google_id)
+    links = ((item or {}).get('volumeInfo') or {}).get('imageLinks') or {}
+    urls: List[str] = []
+    for size in GOOGLE_IMAGE_SIZES:
+        raw = links.get(size)
+        if raw:
+            urls.append(_clean_google_image_url(raw))
+    return urls
+
+
+def _google_genres(isbn: Optional[str], title: Optional[str] = None,
+                   author: Optional[str] = None, google_id: Optional[str] = None) -> List[str]:
+    """Genres from Google Books categories, which are BISAC-style strings such
+    as 'Fiction / Science Fiction / Action & Adventure' — exactly the shape
+    extract_genres already understands.
+
+    Two things make a plain ISBN search insufficient. Google does not index
+    every ISBN, so `isbn:` can miss a book its title search finds happily; and
+    the search endpoint collapses `categories` to a single top-level subject, so
+    the per-volume record has to be fetched to see the real BISAC list. We start
+    from the ISBN when it resolves, fall back to the title and author we already
+    hold when it does not, and in both cases top up from sibling volumes."""
+    item = _google_item_for(isbn, google_id)
+    info = (item or {}).get('volumeInfo') or {}
+
+    genres: List[str] = []
+    lookup_title = clean(title)
+    lookup_author = clean(author)
+
+    if item:
+        genres = extract_genres(_google_categories_for(item))
+        if len(genres) >= 3:
+            return genres
+        lookup_title = (info.get('title') or '').strip() or lookup_title
+        found_authors = info.get('authors') or []
+        if found_authors:
+            lookup_author = found_authors[0]
+
+    if not lookup_title:
+        return genres
+
+    # Multiple authors arrive as one string from the books table; Google matches
+    # a single name far better than a comma-joined list.
+    if lookup_author and ',' in lookup_author:
+        lookup_author = lookup_author.split(',')[0].strip()
+
+    seen = {g.lower() for g in genres}
+    for extra in _google_sibling_categories(lookup_title, lookup_author):
+        if extra.lower() not in seen:
+            seen.add(extra.lower())
+            genres.append(extra)
+    return genres[:MAX_LOOKUP_TAGS]
+
+
+def _normalized(value: Optional[str]) -> str:
+    return re.sub(r'[^a-z0-9]', '', (value or '').lower())
+
+
+def _google_sibling_volumes(title: str, author: Optional[str]) -> List[dict]:
+    """Google volumes that are the same book as `title`/`author`.
+
+    Uses the same quoted query variants as the main search: an unquoted
+    `intitle:` binds only to the first word, which made this match nothing at
+    all for any multi-word title."""
+    if not GOOGLE_BOOKS_ENABLED:
+        return []
+
+    wanted = _normalized(title)
+    wanted_author = _normalized(author)
+    matched: List[dict] = []
+
+    for query in _google_query_variants(title, author, None):
+        params = {'q': query, 'maxResults': 20, 'country': 'US'}
+        if GOOGLE_BOOKS_API_KEY:
+            params['key'] = GOOGLE_BOOKS_API_KEY
+        try:
+            r = requests.get(GOOGLE_BOOKS_URL, params=params, timeout=8)
+            if r.status_code != 200:
+                continue
+            items = r.json().get('items') or []
+        except (requests.RequestException, ValueError):
+            continue
+
+        for item in items:
+            info = item.get('volumeInfo') or {}
+            found_title = _normalized(info.get('title'))
+            # Editions differ by subtitle ("...: A Novel"), so match on either
+            # title being a prefix of the other rather than on equality.
+            if not found_title or not (found_title.startswith(wanted) or wanted.startswith(found_title)):
+                continue
+            # A shared title is not a shared book; confirm the author too when
+            # we know it, so an unrelated namesake cannot donate its genres.
+            if wanted_author:
+                authors = [_normalized(a) for a in (info.get('authors') or [])]
+                if authors and not any(wanted_author in a or a in wanted_author for a in authors):
+                    continue
+            matched.append(item)
+        if matched:
+            break
+    return matched
+
+
+# Per-volume detail costs a request each, so only probe the first few siblings.
+MAX_SIBLING_DETAIL_FETCHES = 5
+
+
+def _google_sibling_categories(title: str, author: Optional[str]) -> List[str]:
+    """Categories from other Google volumes of the same book, used to flesh out
+    a sparsely catalogued edition."""
+    cache_key = f"siblings:{title.lower()}|{(author or '').lower()}"
+    cached = _GOOGLE_CACHE.get(cache_key)
+    if cached and (datetime.utcnow() - cached[0]).total_seconds() < _GOOGLE_CACHE_TTL:
+        return cached[1] or []
+
+    categories: List[str] = []
+    for position, item in enumerate(_google_sibling_volumes(title, author)):
+        if position < MAX_SIBLING_DETAIL_FETCHES:
+            categories.extend(_google_categories_for(item))
+        else:
+            categories.extend((item.get('volumeInfo') or {}).get('categories') or [])
+
+    found = extract_genres(categories)
+    if len(_GOOGLE_CACHE) >= _GOOGLE_CACHE_MAX:
+        _GOOGLE_CACHE.clear()
+    _GOOGLE_CACHE[cache_key] = (datetime.utcnow(), found)
+    return found
+
+
 def _lookup_olid_by_isbn(isbn: Optional[str]) -> Optional[str]:
     """Ask OpenLibrary which edition an ISBN belongs to."""
     cleaned = re.sub(r'[^0-9Xx]', '', isbn or '')
@@ -481,9 +772,33 @@ def _lookup_olid_by_isbn(isbn: Optional[str]) -> Optional[str]:
     return None
 
 
-def _fetch_genres(olid: Optional[str], isbn: Optional[str]) -> List[str]:
-    """Fetch genre tags for an edition from OpenLibrary subjects. Tries the
-    edition first, then falls back to the subjects on its parent work."""
+def _fetch_genres(olid: Optional[str], isbn: Optional[str],
+                  title: Optional[str] = None, author: Optional[str] = None,
+                  google_id: Optional[str] = None) -> List[str]:
+    """Fetch genre tags for an edition, combining both sources.
+
+    Neither catalogue is complete on its own: OpenLibrary carries rich subjects
+    for older titles but often nothing for recent ones, while Google's
+    categories can be as thin as a single "Fiction". Merging keeps whatever each
+    one knows, with OpenLibrary first because its genres tend to be more
+    specific. Title and author let Google still be searched for books whose ISBN
+    it has not indexed; a stored volume id skips that search entirely."""
+    found = _openlibrary_genres(olid, isbn)
+    google = _google_genres(isbn, title, author, google_id)
+    if not google:
+        return found
+    combined = list(found)
+    seen = {g.lower() for g in combined}
+    for genre in google:
+        if genre.lower() not in seen:
+            seen.add(genre.lower())
+            combined.append(genre)
+    return _derive_extra_genres(combined)[:MAX_LOOKUP_TAGS]
+
+
+def _openlibrary_genres(olid: Optional[str], isbn: Optional[str]) -> List[str]:
+    """Genre tags from OpenLibrary subjects: the edition first, then the
+    subjects on its parent work."""
     cleaned_isbn = re.sub(r'[^0-9Xx]', '', isbn or '')
     bibkeys = ([f"OLID:{olid}"] if olid else []) + ([f"ISBN:{cleaned_isbn}"] if cleaned_isbn else [])
     for key in bibkeys:
@@ -551,9 +866,25 @@ def _cover_candidates(isbn: Optional[str], olid: Optional[str], cover_url: Optio
     return [u for u in urls if u]
 
 
-def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_url: Optional[str] = None, only_cover_url: bool = False) -> bool:
-    """Best effort: find a cover for the book and save it in the database."""
-    for url in _cover_candidates(isbn, olid, cover_url, only_cover_url):
+def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_url: Optional[str] = None,
+                 only_cover_url: bool = False, google_id: Optional[str] = None) -> bool:
+    """Best effort: find a cover for the book and save it in the database.
+    OpenLibrary is tried first, then Google Books."""
+    candidates = _cover_candidates(isbn, olid, cover_url, only_cover_url)
+    for url in candidates:
+        result = _download_image(url)
+        if result:
+            content, mime = result
+            conn.execute("UPDATE books SET cover=?, cover_mime=? WHERE id=?", (sqlite3.Binary(content), mime, book_id))
+            conn.commit()
+            return True
+
+    # An explicit address is a specific request; do not quietly substitute
+    # Google's artwork for the picture that was asked for.
+    if only_cover_url:
+        return False
+
+    for url in _google_cover_urls(isbn, google_id):
         result = _download_image(url)
         if result:
             content, mime = result
@@ -634,14 +965,14 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(get_current_
         raise HTTPException(status_code=400, detail="Title is required")
     added = clean_timestamp(b.created_at)
     try:
-        conn.execute("UPDATE books SET title=?, author=?, isbn=?, olid=?, notes=? WHERE id=?", (title, clean(b.author), clean(b.isbn), clean_olid(b.olid), clean(b.notes), book_id))
+        conn.execute("UPDATE books SET title=?, author=?, isbn=?, olid=?, google_id=?, notes=? WHERE id=?", (title, clean(b.author), clean(b.isbn), clean_olid(b.olid), clean_google_id(b.google_id), clean(b.notes), book_id))
         if added:
             conn.execute("UPDATE books SET created_at=? WHERE id=?", (added, book_id))
         conn.commit()
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if clean(b.cover_url):
-        _store_cover(book_id, clean(b.isbn), clean_olid(b.olid), clean(b.cover_url))
+        _store_cover(book_id, clean(b.isbn), clean_olid(b.olid), clean(b.cover_url), google_id=clean_google_id(b.google_id))
     if b.tags is not None:
         set_book_tags(book_id, b.tags)
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
@@ -657,20 +988,21 @@ def add_book(b: Book, current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="Title is required")
     b.title, b.author, b.isbn, b.notes = title, clean(b.author), clean(b.isbn), clean(b.notes)
     b.olid = clean_olid(b.olid)
+    b.google_id = clean_google_id(b.google_id)
     # Allow an explicit added date (e.g. when restoring a deleted book via undo).
     b.created_at = clean_timestamp(b.created_at) or now_iso()
     try:
-        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, notes, created_at) VALUES (?,?,?,?,?,?)", (b.title, b.author, b.isbn, b.olid, b.notes, b.created_at))
+        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, created_at) VALUES (?,?,?,?,?,?,?)", (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.created_at))
         conn.commit()
         b.id = cur.lastrowid
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=400, detail=str(e))
     # Grab a cover while we are adding, so most books never need a manual lookup.
-    b.has_cover = _store_cover(b.id, b.isbn, b.olid, clean(b.cover_url))
+    b.has_cover = _store_cover(b.id, b.isbn, b.olid, clean(b.cover_url), google_id=b.google_id)
     b.cover_url = None
     # Tags: use what the caller supplied, otherwise fetch OpenLibrary subjects.
     supplied = normalize_tags(b.tags)
-    b.tags = set_book_tags(b.id, supplied) if supplied else add_book_tags(b.id, _fetch_genres(b.olid, b.isbn))
+    b.tags = set_book_tags(b.id, supplied) if supplied else add_book_tags(b.id, _fetch_genres(b.olid, b.isbn, b.title, b.author, b.google_id))
     return b
 
 @app.get("/books/{book_id}", response_model=Book)
@@ -694,33 +1026,35 @@ def get_book_cover(book_id: int, current_user: dict = Depends(get_current_user_f
 
 @app.post("/books/{book_id}/cover/lookup", response_model=Book)
 def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_user: dict = Depends(get_current_user)):
-    """Find a cover for an existing book (by explicit URL, stored OLID, or ISBN)."""
-    cur = conn.execute("SELECT id, isbn, olid FROM books WHERE id=?", (book_id,))
+    """Find a cover for an existing book (by explicit URL, stored OLID, or ISBN),
+    falling back to Google Books when OpenLibrary has none."""
+    cur = conn.execute("SELECT id, isbn, olid, google_id FROM books WHERE id=?", (book_id,))
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
     supplied = clean(cover_url)
-    if not _store_cover(book_id, row['isbn'], row['olid'], supplied, only_cover_url=bool(supplied)):
+    if not _store_cover(book_id, row['isbn'], row['olid'], supplied, only_cover_url=bool(supplied), google_id=row['google_id']):
         if supplied:
             raise HTTPException(status_code=400, detail="That address did not return a usable image. It needs to be a direct link to an image file under 5 MB.")
-        raise HTTPException(status_code=404, detail="No cover found for this book")
+        raise HTTPException(status_code=404, detail="No cover found for this book on OpenLibrary or Google Books")
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone())
 
 @app.post("/books/{book_id}/tags/lookup", response_model=Book)
 def lookup_book_tags(book_id: int, replace: bool = False, current_user: dict = Depends(get_current_user)):
-    """Fetch genre tags from OpenLibrary. Adds to the book's tags by default;
-    pass replace=true to swap them out (used by the Refresh button, so stale or
+    """Fetch genre tags from OpenLibrary, falling back to Google Books
+    categories. Adds to the book's tags by default; pass replace=true to swap
+    them out (used by the Refresh button, so stale or
     noisy tags do not stick around)."""
-    cur = conn.execute("SELECT id, isbn, olid FROM books WHERE id=?", (book_id,))
+    cur = conn.execute("SELECT id, isbn, olid, google_id, title, author FROM books WHERE id=?", (book_id,))
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
-    if not clean(row['isbn']) and not clean(row['olid']):
-        raise HTTPException(status_code=400, detail="This book needs an ISBN or OLID to look up tags")
-    found = _fetch_genres(row['olid'], row['isbn'])
+    if not clean(row['isbn']) and not clean(row['olid']) and not clean(row['title']):
+        raise HTTPException(status_code=400, detail="This book needs an ISBN, OLID or title to look up tags")
+    found = _fetch_genres(row['olid'], row['isbn'], row['title'], row['author'], row['google_id'])
     if not found:
-        raise HTTPException(status_code=404, detail="No tags found on OpenLibrary for this book")
+        raise HTTPException(status_code=404, detail="No tags found for this book on OpenLibrary or Google Books")
     tags = set_book_tags(book_id, found) if replace else add_book_tags(book_id, found)
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone(), tags)
@@ -738,6 +1072,32 @@ def lookup_book_olid(book_id: int, current_user: dict = Depends(get_current_user
     if not olid:
         raise HTTPException(status_code=404, detail="No OpenLibrary edition found for this ISBN")
     conn.execute("UPDATE books SET olid=? WHERE id=?", (olid, book_id))
+    conn.commit()
+    cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
+    return book_from_row(cur.fetchone())
+
+@app.post("/books/{book_id}/google/lookup", response_model=Book)
+def lookup_book_google_id(book_id: int, current_user: dict = Depends(get_current_user)):
+    """Resolve the Google Books volume id for an existing book.
+
+    Storing it lets later tag and cover lookups go straight to the volume record
+    instead of searching for it first, and pins the book to one exact edition."""
+    cur = conn.execute("SELECT id, isbn, title, author FROM books WHERE id=?", (book_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    volume_id = (_google_volume_item(row['isbn']) or {}).get('id')
+    if not volume_id and clean(row['title']):
+        author = clean(row['author']) or ''
+        if ',' in author:
+            author = author.split(',')[0].strip()
+        siblings = _google_sibling_volumes(row['title'], author or None)
+        volume_id = siblings[0].get('id') if siblings else None
+    if not volume_id:
+        raise HTTPException(status_code=404, detail="No Google Books volume found for this book")
+
+    conn.execute("UPDATE books SET google_id=? WHERE id=?", (volume_id, book_id))
     conn.commit()
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone())
@@ -771,7 +1131,7 @@ def delete_book_cover(book_id: int, current_user: dict = Depends(get_current_use
 
 @app.post("/books/import")
 async def import_books(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
-    """Accepts a CSV file with headers: title,author,isbn,olid,tags,notes
+    """Accepts a CSV file with headers: title,author,isbn,olid,google_id,tags,notes
     (tags separated by ';' or '|', since ',' is the column separator)"""
     content = (await file.read()).decode('utf-8')
     reader = csv.DictReader(io.StringIO(content))
@@ -784,10 +1144,11 @@ async def import_books(file: UploadFile = File(...), current_user: dict = Depend
         author = clean(row.get('author') or row.get('Author'))
         isbn = clean(row.get('isbn') or row.get('ISBN'))
         olid = clean_olid(row.get('olid') or row.get('OLID'))
+        google_id = clean_google_id(row.get('google_id') or row.get('Google ID') or row.get('googleid'))
         notes = clean(row.get('notes') or row.get('Notes'))
         tags = normalize_tags(re.split(r'[;|]', row.get('tags') or row.get('Tags') or ''))
         try:
-            cur = conn.execute("INSERT OR IGNORE INTO books (title, author, isbn, olid, notes, created_at) VALUES (?,?,?,?,?,?)", (title, author, isbn, olid, notes, added_at))
+            cur = conn.execute("INSERT OR IGNORE INTO books (title, author, isbn, olid, google_id, notes, created_at) VALUES (?,?,?,?,?,?,?)", (title, author, isbn, olid, google_id, notes, added_at))
             if tags and cur.lastrowid and cur.rowcount:
                 set_book_tags(cur.lastrowid, tags)
             inserted += 1
@@ -892,13 +1253,124 @@ def _edition_title(entry: dict, detail: dict, fallback: Optional[str]) -> str:
     return fallback or ''
 
 
+def _google_query_variants(title: Optional[str], author: Optional[str], q: Optional[str]) -> List[str]:
+    """Build Google Books queries, most precise first.
+
+    `intitle:` and `inauthor:` bind only to the text immediately following them,
+    so an unquoted multi-word title silently degrades: `intitle:Songs of the
+    Dead` searches titles for "Songs" and treats the rest as loose keywords.
+    Quoting keeps the phrase together. The plain free-text variant is what
+    books.google.com effectively runs, and is kept as a fallback because an
+    exact-phrase title match fails on subtitles and punctuation differences."""
+    title = (title or '').strip()
+    author = (author or '').strip()
+    q = (q or '').strip()
+
+    if q:
+        return [q]
+
+    variants: List[str] = []
+    fielded: List[str] = []
+    if title:
+        fielded.append(f'intitle:"{title}"')
+    if author:
+        fielded.append(f'inauthor:"{author}"')
+    if fielded:
+        variants.append(' '.join(fielded))
+
+    # Loosen the author first: a title is the stronger signal, and author
+    # spellings differ between catalogues more often than titles do.
+    if title and author:
+        variants.append(f'intitle:"{title}"')
+
+    plain = ' '.join(x for x in (title, author) if x)
+    if plain:
+        variants.append(plain)
+    return variants
+
+
+def _google_search(title: Optional[str], author: Optional[str], q: Optional[str]) -> List[dict]:
+    """Search Google Books and shape the results like the OpenLibrary ones, so
+    the frontend can render them with the same edition picker.
+
+    Google returns individual volumes rather than works with editions, so each
+    volume becomes a single-edition result."""
+    if not GOOGLE_BOOKS_ENABLED:
+        return []
+
+    items: List[dict] = []
+    for query in _google_query_variants(title, author, q):
+        params = {'q': query, 'maxResults': 10, 'country': 'US'}
+        if GOOGLE_BOOKS_API_KEY:
+            params['key'] = GOOGLE_BOOKS_API_KEY
+        try:
+            r = requests.get(GOOGLE_BOOKS_URL, params=params, timeout=8)
+            if r.status_code != 200:
+                continue
+            items = r.json().get('items') or []
+        except (requests.RequestException, ValueError):
+            continue
+        if items:
+            break
+
+    results = []
+    for item in items:
+        info = item.get('volumeInfo') or {}
+        isbns = [i.get('identifier') for i in (info.get('industryIdentifiers') or [])
+                 if i.get('type', '').startswith('ISBN') and i.get('identifier')]
+        # Prefer ISBN-13 so the stored value matches the OpenLibrary path.
+        isbns.sort(key=lambda x: len(x or ''), reverse=True)
+
+        links = info.get('imageLinks') or {}
+        cover = None
+        for size in GOOGLE_IMAGE_SIZES:
+            if links.get(size):
+                cover = _clean_google_image_url(links[size])
+                break
+
+        full_title = info.get('title') or ''
+        if info.get('subtitle'):
+            full_title = f"{full_title}: {info['subtitle']}"
+
+        published = info.get('publishedDate') or ''
+        year = None
+        if published[:4].isdigit():
+            year = int(published[:4])
+
+        results.append({
+            'title': info.get('title'),
+            'authors': info.get('authors') or [],
+            'publish_year': year,
+            'edition_keys': [],
+            'isbns': isbns,
+            'work_key': f"google:{item.get('id')}",
+            'google_id': item.get('id'),
+            'source': 'google',
+            'editions': [{
+                'olid': None,
+                'google_id': item.get('id'),
+                'title': full_title,
+                'publish_date': published or None,
+                'publishers': [info['publisher']] if info.get('publisher') else [],
+                'number_of_pages': info.get('pageCount'),
+                'format': info.get('printType'),
+                'isbns': isbns,
+                'language': info.get('language') or 'unknown',
+                'cover': cover,
+                'source': 'google',
+            }],
+        })
+    return results
+
+
 @app.get("/search")
 def search_openlibrary(title: Optional[str] = None, author: Optional[str] = None, q: Optional[str] = None,
                        include_all_languages: bool = False,
                        current_user: dict = Depends(get_current_user)):
     """Search OpenLibrary by title and/or author and return candidate works with
     their editions. Editions default to English only; pass include_all_languages=true
-    to keep translations as well."""
+    to keep translations as well. Falls back to Google Books when OpenLibrary
+    returns nothing."""
     params = {"limit": 10}
     if q:
         params['q'] = q.strip()
@@ -912,13 +1384,19 @@ def search_openlibrary(title: Optional[str] = None, author: Optional[str] = None
 
     try:
         r = requests.get(f"{OL_BASE}/search.json", params=params, timeout=8)
-    except requests.RequestException:
-        raise HTTPException(status_code=502, detail="Search failed")
-    if r.status_code != 200:
+        docs = r.json().get('docs', []) if r.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        docs = None
+
+    if docs is None:
+        # OpenLibrary is unreachable or erroring; Google Books can still answer.
+        google = _google_search(title, author, q)
+        if google:
+            return google
         raise HTTPException(status_code=502, detail="Search failed")
 
     results = []
-    for doc in r.json().get('docs', [])[:10]:
+    for doc in docs[:10]:
         work_key = doc.get('key')
         isbns = list(doc.get('isbn', []) or [])
         entries_map = {}
@@ -989,7 +1467,57 @@ def search_openlibrary(title: Optional[str] = None, author: Optional[str] = None
             'work_key': work_key,
             'editions': editions_meta,
         })
-    return results
+
+    return _merge_google_results(results, title, author, q)
+
+
+def _merge_google_results(results: List[dict], title: Optional[str], author: Optional[str],
+                          q: Optional[str]) -> List[dict]:
+    """Append Google Books hits that OpenLibrary did not already return.
+
+    OpenLibrary answering at all is not the same as it answering *usefully*: a
+    search for a recent title often comes back with unrelated works, which used
+    to mean the Google fallback never ran. Merging instead of falling back means
+    a book Google knows about always shows up, marked so its origin is obvious."""
+    google = _google_search(title, author, q)
+    if not google:
+        return results
+
+    def isbn_keys(entry: dict) -> set:
+        keys = {re.sub(r'[^0-9Xx]', '', str(i)) for i in (entry.get('isbns') or [])}
+        for ed in entry.get('editions') or []:
+            keys |= {re.sub(r'[^0-9Xx]', '', str(i)) for i in (ed.get('isbns') or [])}
+        return {k for k in keys if k}
+
+    seen: set = set()
+    for entry in results:
+        seen |= isbn_keys(entry)
+
+    def title_key(entry: dict) -> str:
+        return re.sub(r'[^a-z0-9]', '', (entry.get('title') or '').lower())
+
+    def author_key(entry: dict) -> str:
+        first = (entry.get('authors') or [''])[0] or ''
+        return re.sub(r'[^a-z0-9]', '', first.lower())
+
+    # Title alone is not an identity: plenty of unrelated books share one, and
+    # dropping on title would have hidden a Google hit whenever OpenLibrary
+    # happened to return a different book of the same name.
+    seen_books = {(title_key(r), author_key(r)) for r in results if r.get('title')}
+
+    merged = list(results)
+    for entry in google:
+        keys = isbn_keys(entry)
+        if keys & seen:
+            continue
+        # Same title *and* author from both sources: OpenLibrary's record has
+        # real editions, so keep it rather than showing the book twice.
+        if (title_key(entry), author_key(entry)) in seen_books:
+            continue
+        merged.append(entry)
+        seen |= keys
+        seen_books.add((title_key(entry), author_key(entry)))
+    return merged[:20]
 
 @app.get("/edition/{olid}")
 def get_edition(olid: str, current_user: dict = Depends(get_current_user)):
@@ -1016,23 +1544,173 @@ def get_edition(olid: str, current_user: dict = Depends(get_current_user)):
 
 @app.get("/lookup/{isbn}")
 def lookup_isbn(isbn: str, current_user: dict = Depends(get_current_user)):
-    """Lookup ISBN via OpenLibrary and return basic metadata."""
+    """Look an ISBN up on OpenLibrary, falling back to Google Books."""
     isbn = isbn.strip()
     url = f"https://openlibrary.org/api/books?bibkeys=ISBN:{isbn}&format=json&jscmd=data"
+    item = None
     try:
         r = requests.get(url, timeout=5)
-    except requests.RequestException:
-        raise HTTPException(status_code=502, detail="Lookup failed")
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail="Lookup failed")
-    data = r.json()
-    key = f"ISBN:{isbn}"
-    if key not in data:
+        if r.status_code == 200:
+            item = r.json().get(f"ISBN:{isbn}")
+    except (requests.RequestException, ValueError):
+        item = None
+
+    if item:
+        return {
+            "title": item.get("title"),
+            "authors": [a.get("name") for a in item.get("authors", [])],
+            "publish_date": item.get("publish_date"),
+            "olid": clean_olid(item.get("key")) or _lookup_olid_by_isbn(isbn),
+            # Worth resolving even when OpenLibrary answered: storing it makes
+            # later tag and cover lookups a single request.
+            "google_id": (_google_volume_item(isbn) or {}).get("id"),
+            "source": "openlibrary",
+        }
+
+    # OpenLibrary has nothing (or is down): try Google Books before giving up.
+    google_item = _google_volume_item(isbn)
+    info = (google_item or {}).get("volumeInfo")
+    if not info:
         return {}
-    item = data[key]
+    title = info.get("title")
+    subtitle = info.get("subtitle")
     return {
-        "title": item.get("title"),
-        "authors": [a.get("name") for a in item.get("authors", [])],
-        "publish_date": item.get("publish_date"),
-        "olid": clean_olid(item.get("key")) or _lookup_olid_by_isbn(isbn),
+        "title": f"{title}: {subtitle}" if title and subtitle else title,
+        "authors": info.get("authors") or [],
+        "publish_date": info.get("publishedDate"),
+        # Google has no OpenLibrary id, but OpenLibrary may still know the
+        # edition even when its books API returned nothing useful.
+        "olid": _lookup_olid_by_isbn(isbn),
+        "google_id": google_item.get("id"),
+        "source": "google",
     }
+
+
+@app.get("/diagnostics/search")
+def diagnose_search(title: Optional[str] = None, author: Optional[str] = None,
+                    q: Optional[str] = None,
+                    current_user: dict = Depends(get_current_user_flexible)):
+    """Show the exact Google Books queries a search would run and what each one
+    returns, so a missing book can be traced to the query rather than guessed at.
+
+    Declared before /diagnostics/{isbn} so the literal path wins the match."""
+    report: dict = {
+        "google_enabled": GOOGLE_BOOKS_ENABLED,
+        "google_api_key_set": bool(GOOGLE_BOOKS_API_KEY),
+        "attempts": [],
+    }
+    for query in _google_query_variants(title, author, q):
+        params = {'q': query, 'maxResults': 10, 'country': 'US'}
+        if GOOGLE_BOOKS_API_KEY:
+            params['key'] = GOOGLE_BOOKS_API_KEY
+        attempt: dict = {"query": query}
+        try:
+            r = requests.get(GOOGLE_BOOKS_URL, params=params, timeout=8)
+            payload = r.json() if r.content else {}
+            items = payload.get('items') or []
+            attempt["http_status"] = r.status_code
+            attempt["total_items"] = payload.get('totalItems')
+            attempt["results"] = [
+                {"title": (i.get('volumeInfo') or {}).get('title'),
+                 "authors": (i.get('volumeInfo') or {}).get('authors'),
+                 "categories": (i.get('volumeInfo') or {}).get('categories') or []}
+                for i in items[:10]
+            ]
+            if r.status_code != 200:
+                attempt["error"] = (payload.get('error') or {}).get('message') or r.text[:200]
+        except (requests.RequestException, ValueError) as e:
+            attempt["error"] = str(e)
+        report["attempts"].append(attempt)
+        if attempt.get("results"):
+            attempt["used"] = True
+            break
+    return report
+
+
+@app.get("/diagnostics/{isbn}")
+def diagnose_sources(isbn: str, title: Optional[str] = None, author: Optional[str] = None,
+                     current_user: dict = Depends(get_current_user_flexible)):
+    """Show what each catalogue actually holds for an ISBN, and what the genre
+    extractor makes of it. Useful when a book comes back with fewer tags than
+    expected — it separates "the source has nothing" from "we dropped it"."""
+    cleaned = re.sub(r'[^0-9Xx]', '', isbn or '')
+    # Always report live data: a cached miss from a few minutes ago would make a
+    # working fix look broken.
+    _GOOGLE_CACHE.clear()
+    report: dict = {
+        "isbn": cleaned,
+        "google_enabled": GOOGLE_BOOKS_ENABLED,
+        "google_api_key_set": bool(GOOGLE_BOOKS_API_KEY),
+    }
+
+    # --- OpenLibrary ---
+    ol_subjects: List[str] = []
+    try:
+        r = requests.get(f"{OL_BASE}/api/books?bibkeys=ISBN:{cleaned}&format=json&jscmd=data", timeout=8)
+        item = r.json().get(f"ISBN:{cleaned}") if r.status_code == 200 else None
+        if item:
+            ol_subjects = [s.get('name') if isinstance(s, dict) else s for s in (item.get('subjects') or [])]
+        report["openlibrary"] = {
+            "http_status": r.status_code,
+            "found": bool(item),
+            "title": (item or {}).get("title"),
+            "raw_subjects": ol_subjects,
+            "extracted_genres": extract_genres(ol_subjects),
+        }
+    except (requests.RequestException, ValueError) as e:
+        report["openlibrary"] = {"error": str(e)}
+
+    # --- Google Books, unfiltered so quota errors are visible ---
+    params = {'q': f'isbn:{cleaned}', 'maxResults': 1, 'country': 'US'}
+    if GOOGLE_BOOKS_API_KEY:
+        params['key'] = GOOGLE_BOOKS_API_KEY
+    try:
+        r = requests.get(GOOGLE_BOOKS_URL, params=params, timeout=8)
+        payload = r.json() if r.content else {}
+        items = payload.get('items') or []
+        item = items[0] if items else None
+        info = (item.get('volumeInfo') or {}) if item else {}
+        detail_categories = _google_categories_for(item)
+        google: dict = {
+            "http_status": r.status_code,
+            "found": bool(items),
+            "volume_id": (item or {}).get("id"),
+            "title": info.get("title"),
+            "authors": info.get("authors"),
+            # What the search endpoint returned, versus the fuller per-volume
+            # record. These differing is the normal case, not a fault.
+            "search_categories": info.get("categories") or [],
+            "detail_categories": detail_categories,
+            "extracted_genres": extract_genres(detail_categories),
+            "image_links": list((info.get('imageLinks') or {}).keys()),
+        }
+        if r.status_code != 200:
+            google["error"] = (payload.get('error') or {}).get('message') or r.text[:200]
+
+        # Mirror the real path: when the ISBN is not indexed, the sibling search
+        # falls back to the title and author we already hold for the book.
+        sibling_title = info.get('title') or clean(title) or (report.get("openlibrary") or {}).get("title")
+        sibling_author = (info.get('authors') or [None])[0] or clean(author)
+        if sibling_author and ',' in sibling_author:
+            sibling_author = sibling_author.split(',')[0].strip()
+        google["sibling_search"] = {"title": sibling_title, "author": sibling_author}
+        if sibling_title:
+            siblings = _google_sibling_volumes(sibling_title, sibling_author)
+            google["siblings"] = [
+                {"title": (s.get("volumeInfo") or {}).get("title"),
+                 "authors": (s.get("volumeInfo") or {}).get("authors"),
+                 "search_categories": (s.get("volumeInfo") or {}).get("categories") or [],
+                 "detail_categories": _google_categories_for(s)}
+                for s in siblings[:5]
+            ]
+            google["sibling_genres"] = _google_sibling_categories(sibling_title, sibling_author)
+        report["google"] = google
+    except (requests.RequestException, ValueError) as e:
+        report["google"] = {"error": str(e)}
+
+    report["final_tags"] = _fetch_genres(
+        None, cleaned,
+        clean(title) or (report.get("google") or {}).get("title") or (report.get("openlibrary") or {}).get("title"),
+        clean(author) or ", ".join((report.get("google") or {}).get("authors") or []) or None)
+    return report
+

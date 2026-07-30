@@ -5,7 +5,8 @@ anywhere Docker does — it was built to live on a Synology NAS.
 
 - Add books manually, or look them up on [OpenLibrary](https://openlibrary.org)
   by title/author and pick the exact edition (cover, publisher, publish date,
-  page count) or by ISBN.
+  page count) or by ISBN, with [Google Books](https://books.google.com) as a
+  fallback for anything OpenLibrary does not know about.
 - Browse, search, edit and delete your library from the browser, with undo.
 - Sort the library by title, author or date added.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
@@ -69,6 +70,8 @@ All settings live in `.env` (never committed — see `.env.example`).
 | ---------------- | -------------------------------------------------------------- |
 | `SECRET_KEY`     | Signs JWT access tokens. **Generate your own.**                 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default `480`, i.e. 8 hours)       |
+| `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
+| `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
 | `BACKEND_PORT`   | Host port for the API (default `8882`)                          |
 | `FRONTEND_PORT`  | Host port for the UI (default `3006`)                           |
 | `VITE_API_BASE`  | Backend URL baked into the frontend bundle at build time        |
@@ -114,7 +117,7 @@ sudo chown -R <uid>:<gid> ./backend
 
 ## CSV import
 
-Upload a CSV with the headers `title,author,isbn,olid,tags,notes` (only `title`
+Upload a CSV with the headers `title,author,isbn,olid,google_id,tags,notes` (only `title`
 is required). Separate tags with `;` or `|`, since `,` is the column separator.
 Rows whose ISBN already exists are skipped.
 
@@ -138,11 +141,14 @@ All routes except `/health` and `/token` require an
 | `POST`   | `/books/{id}/cover/lookup` | Find a cover on OpenLibrary   |
 | `DELETE` | `/books/{id}/cover` | Remove the stored cover                |
 | `POST`   | `/books/{id}/olid/lookup` | Resolve the OLID from the ISBN |
+| `POST`   | `/books/{id}/google/lookup` | Resolve the Google Books volume id |
 | `POST`   | `/books/{id}/tags/lookup` | Add genre tags, `?replace=true` to swap |
 | `GET`    | `/tags`           | Tags in use, with book counts            |
 | `GET`    | `/search`         | OpenLibrary search by `title`/`author`   |
 | `GET`    | `/lookup/{isbn}`  | OpenLibrary lookup by ISBN               |
 | `GET`    | `/edition/{olid}` | OpenLibrary edition detail by OLID       |
+| `GET`    | `/diagnostics/{isbn}` | What each catalogue holds for an ISBN |
+| `GET`    | `/diagnostics/search` | The Google queries a search would run |
 
 `/search` returns English editions by default; pass
 `include_all_languages=true` to include translations.
@@ -153,16 +159,28 @@ insert order. `created_at` is editable: send a `YYYY-MM-DD` date (or a full
 timestamp) on `POST`/`PUT /books`; omit it on `PUT` to leave the stored value
 untouched. Dates are stored and displayed in UTC.
 
-Cover images are stored as BLOBs in the `books` table. Adding a book fetches its
-cover automatically (from the chosen edition, its OLID, or its ISBN); for books
-that have none, use the **Lookup** button in the Manage tab, or **Upload** your
-own image.
+Cover images are stored as BLOBs in the `cover` column of the `books` table, with
+the content type in `cover_mime`. Adding a book fetches its cover automatically
+(from the chosen edition, its OLID, or its ISBN, then Google Books); for books
+that have none, use the **Lookup** button in the Manage tab, paste a direct image
+address, or **Upload** your own file. List responses never carry the image data —
+they return a `has_cover` flag, and the bytes are served on demand from
+`GET /books/{id}/cover`.
 
 Books have a dedicated `olid` column for the OpenLibrary edition id. It is filled
 in automatically when you add from search results and is optional everywhere
 else; the Manage tab has a **Lookup** button that resolves it from the ISBN.
 Existing rows that stored `OLID:OL12345M` in their notes are migrated into the
 column on first start.
+
+There is a matching `google_id` column for the Google Books volume id (e.g.
+`otCEEQAAQBAJ`). Storing it is worthwhile because a tag or cover lookup would
+otherwise have to *search* for the volume before it can fetch it — with the id on
+hand that becomes a single request, and it pins the book to one exact edition
+instead of relying on a title match. Both ids share a **Sources** column in the
+Manage tab, each linking to its catalogue page, with a lookup button when
+missing. A stored id that no longer resolves falls back to searching, so a stale
+value degrades rather than breaks.
 
 Tags come from OpenLibrary subjects and live in their own `tags` / `book_tags`
 tables. Rather than storing subjects verbatim (they include awards, bestseller
@@ -182,6 +200,109 @@ every book currently listed. Tags are editable inline as a comma-separated list,
 long lists collapse to the first 3 with a `… +N` toggle, and the tag cloud above
 the table filters the library (select several and tick *Match all selected* to
 narrow instead of widen).
+
+## Google Books fallback
+
+OpenLibrary is the primary source, but its coverage is patchy — newer and
+self-published titles often have no subjects, no cover, or no record at all.
+Google Books is consulted as a fallback in four places:
+
+| Feature | Order |
+| ------- | ----- |
+| Tags | OpenLibrary edition subjects + parent work subjects, **merged with** Google `categories` |
+| Covers | explicit URL → OpenLibrary by OLID → by ISBN → Google `imageLinks` |
+| ISBN lookup | OpenLibrary → Google volume metadata |
+| Title/author search | OpenLibrary results, **merged with** Google hits it did not already return |
+
+A stored `google_id` short-circuits the Google half of all of these: the volume
+is fetched directly instead of being searched for first.
+
+Search and tags merge rather than fall back, because OpenLibrary answering at all
+is not the same as it answering usefully: a search for a recent title often
+returns unrelated works, which would stop a pure fallback from ever running.
+Google hits are deduplicated against the OpenLibrary ones by ISBN and by title,
+and the OpenLibrary record wins a tie because it carries real edition data.
+Google entries are marked *via Google Books* in the results.
+
+Google's own categories can be as thin as a single `Fiction` even for a book it
+knows well, so when an ISBN's record is that sparse the backend also checks other
+Google volumes with the same title and merges their categories in.
+
+Google's categories are already BISAC-style (`Fiction / Science Fiction / Hard
+Science Fiction`), so they feed straight into the same genre extractor. One
+wrinkle: the **search** endpoint collapses `categories` to a single top-level
+subject, so a book whose real subjects are `Fiction / Fantasy / Urban` and
+`Fiction / Fantasy / Historical` comes back as just `["Fiction"]`. The backend
+therefore follows up with a per-volume `GET /volumes/{id}`, which returns the
+full list. Google cover URLs are upgraded to `https` and stripped of the
+`edge=curl` page-curl effect, and the largest available size is preferred.
+Search results from Google are reshaped to match the OpenLibrary response, so
+the edition picker renders them identically.
+
+Set `GOOGLE_BOOKS_API_KEY` in `.env`. It works without one, but Google shares a
+per-IP anonymous quota that is frequently already exhausted (HTTP 429), so the
+fallback will be unreliable. Enable the *Books API* in a Google Cloud project and
+create an API key. Set `GOOGLE_BOOKS_ENABLED=false` to turn the fallback off.
+
+Results are cached in-process for 10 minutes, including misses, so adding a book
+does not hit Google three times for the same ISBN.
+
+### Diagnosing a book with missing tags
+
+Both diagnostic endpoints accept `?token=<jwt>` as well as an `Authorization`
+header, so you can paste the URL straight into a browser. Get a token with:
+
+```bash
+curl -s -X POST http://localhost:8882/token \
+     -d 'username=YOURUSER&password=YOURPASS' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+```
+
+`GET /diagnostics/{isbn}` reports what each catalogue actually holds and what the
+genre extractor made of it, which separates "the source has nothing" from "we
+dropped it". Pass `?title=` and `?author=` to mirror what a real lookup would
+use when Google has not indexed the ISBN:
+
+```
+http://localhost:8882/diagnostics/9781668068168?title=Songs+of+the+Dead&author=Brandon+Sanderson&token=YOUR_TOKEN
+```
+
+```jsonc
+{
+  "google_api_key_set": true,
+  "openlibrary": { "found": false, "raw_subjects": [], "extracted_genres": [] },
+  "google": {
+    "http_status": 200,
+    "found": true,
+    "volume_id": "otCEEQAAQBAJ",
+    "search_categories": ["Fiction"],                    // what the search endpoint gives
+    "detail_categories": ["Fiction / Fantasy / Urban"],  // what GET /volumes/{id} gives
+    "extracted_genres": ["Fiction", "Fantasy", "Urban"],
+    "sibling_search": { "title": "Songs of the Dead", "author": "Brandon Sanderson" },
+    "siblings": [],
+    "sibling_genres": []
+  },
+  "final_tags": ["Fiction", "Fantasy", "Urban"]
+}
+```
+
+Read it top down:
+
+| Field | Meaning |
+| ----- | ------- |
+| `google.http_status: 429` | Quota exhausted — set `GOOGLE_BOOKS_API_KEY` |
+| `google_api_key_set: false` | The key is not reaching the container |
+| `google.found: false` | Google has not indexed that ISBN; the sibling search by title takes over |
+| `search_categories` thin, `detail_categories` full | Normal — the per-volume fetch is doing its job |
+| `siblings: []` | No Google volume matched the title and author |
+| `detail_categories: []` everywhere | Google genuinely holds no genres for this book |
+| `sibling_genres` full but `final_tags` thin | The bug is in our merging, not the source |
+
+`GET /diagnostics/search?title=…&author=…` does the same for searching: it lists
+the exact Google queries that would run, in order, with the titles and categories
+each returned and which one was used.
+
+The diagnostics endpoints clear the lookup cache before running, so they always
+report live data.
 
 Interactive docs are at `http://localhost:8882/docs`.
 
