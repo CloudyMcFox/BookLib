@@ -304,6 +304,20 @@ function CoverCell({book, onChanged, onError}){
     if(fileRef.current) fileRef.current.value = ''
   }
 
+  const fromUrl = async ()=>{
+    const entered = prompt('Paste the web address of a cover image')
+    if(entered === null) return
+    const url = entered.trim()
+    if(!url) return
+    setBusy(true); onError(null)
+    try{
+      const res = await fetch(API_BASE + '/books/' + book.id + '/cover/lookup?cover_url=' + encodeURIComponent(url), {method:'POST', headers: authHeaders()})
+      if(!res.ok){ onError(await readError(res)) }
+      else apply(await res.json())
+    }catch(err){ onError(friendlyMessage(err.message)) }
+    setBusy(false)
+  }
+
   const remove = async ()=>{
     if(!confirm(`Remove the cover for "${book.title}"?`)) return
     setBusy(true); onError(null)
@@ -324,6 +338,7 @@ function CoverCell({book, onChanged, onError}){
         {!book.has_cover && <button type="button" onClick={lookup} disabled={busy}>{busy? '...' : 'Lookup'}</button>}
         {book.has_cover && <button type="button" onClick={remove} disabled={busy}>Remove</button>}
         <button type="button" onClick={()=>fileRef.current && fileRef.current.click()} disabled={busy}>Upload</button>
+        <button type="button" onClick={fromUrl} disabled={busy}>From URL</button>
         <input ref={fileRef} type="file" accept="image/*" style={{display:'none'}} onChange={e=>upload(e.target.files && e.target.files[0])} />
       </div>
     </div>

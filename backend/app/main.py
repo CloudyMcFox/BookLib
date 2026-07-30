@@ -529,7 +529,7 @@ def _fetch_genres(olid: Optional[str], isbn: Optional[str]) -> List[str]:
     return []
 
 
-def _cover_candidates(isbn: Optional[str], olid: Optional[str], cover_url: Optional[str]) -> List[str]:
+def _cover_candidates(isbn: Optional[str], olid: Optional[str], cover_url: Optional[str], only_cover_url: bool = False) -> List[str]:
     urls: List[str] = []
     if cover_url:
         url = cover_url.strip()
@@ -537,6 +537,11 @@ def _cover_candidates(isbn: Optional[str], olid: Optional[str], cover_url: Optio
         if 'covers.openlibrary.org' in url:
             url = re.sub(r'-(S|M)\.jpg', '-L.jpg', url)
         urls.append(url)
+        # A hand-typed address is a specific request, not a hint: quietly
+        # falling back to the OpenLibrary artwork would store a different
+        # picture than the one that was asked for and still report success.
+        if only_cover_url:
+            return [u for u in urls if u]
     if olid:
         urls.append(f"{COVERS_BASE}/olid/{olid}-L.jpg?default=false")
     if isbn:
@@ -546,9 +551,9 @@ def _cover_candidates(isbn: Optional[str], olid: Optional[str], cover_url: Optio
     return [u for u in urls if u]
 
 
-def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_url: Optional[str] = None) -> bool:
+def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_url: Optional[str] = None, only_cover_url: bool = False) -> bool:
     """Best effort: find a cover for the book and save it in the database."""
-    for url in _cover_candidates(isbn, olid, cover_url):
+    for url in _cover_candidates(isbn, olid, cover_url, only_cover_url):
         result = _download_image(url)
         if result:
             content, mime = result
@@ -694,7 +699,10 @@ def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_use
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
-    if not _store_cover(book_id, row['isbn'], row['olid'], clean(cover_url)):
+    supplied = clean(cover_url)
+    if not _store_cover(book_id, row['isbn'], row['olid'], supplied, only_cover_url=bool(supplied)):
+        if supplied:
+            raise HTTPException(status_code=400, detail="That address did not return a usable image. It needs to be a direct link to an image file under 5 MB.")
         raise HTTPException(status_code=404, detail="No cover found for this book")
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone())
