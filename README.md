@@ -8,7 +8,8 @@ anywhere Docker does — it was built to live on a Synology NAS.
   page count) or by ISBN, with [Google Books](https://books.google.com) as a
   fallback for anything OpenLibrary does not know about.
 - Browse, search, edit and delete your library from the browser, with undo.
-- Sort the library by title, author or date added.
+- Sort the library by title, author, date added or shelf location.
+- Record where each book physically lives, on shelves you define yourself.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
 - Cover images are downloaded from OpenLibrary and stored in the database, with
   a manual lookup/upload button for books that are missing one.
@@ -72,6 +73,7 @@ All settings live in `.env` (never committed — see `.env.example`).
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default `480`, i.e. 8 hours)       |
 | `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
 | `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
+| `DEFAULT_SHELF_COLUMNS` / `DEFAULT_SHELF_ROWS` | Size of the shelf seeded on a new database (default `6` / `8`) |
 | `BACKEND_PORT`   | Host port for the API (default `8882`)                          |
 | `FRONTEND_PORT`  | Host port for the UI (default `3006`)                           |
 | `VITE_API_BASE`  | Backend URL baked into the frontend bundle at build time        |
@@ -144,6 +146,12 @@ All routes except `/health` and `/token` require an
 | `POST`   | `/books/{id}/google/lookup` | Resolve the Google Books volume id |
 | `POST`   | `/books/{id}/tags/lookup` | Add genre tags, `?replace=true` to swap |
 | `GET`    | `/tags`           | Tags in use, with book counts            |
+| `GET`    | `/shelves`        | Shelves with their sizes and book counts |
+| `POST`   | `/shelves`        | Add a shelf                              |
+| `PUT`    | `/shelves/{id}`   | Rename or resize a shelf                 |
+| `DELETE` | `/shelves/{id}`   | Delete a shelf, unplacing its books      |
+| `GET`    | `/shelves/{id}/layout` | A shelf plus what is in each slot   |
+| `PUT`    | `/books/{id}/location` | Set or clear where a book lives     |
 | `GET`    | `/search`         | OpenLibrary search by `title`/`author`   |
 | `GET`    | `/lookup/{isbn}`  | OpenLibrary lookup by ISBN               |
 | `GET`    | `/edition/{olid}` | OpenLibrary edition detail by OLID       |
@@ -200,6 +208,44 @@ every book currently listed. Tags are editable inline as a comma-separated list,
 long lists collapse to the first 3 with a `… +N` toggle, and the tag cloud above
 the table filters the library (select several and tick *Match all selected* to
 narrow instead of widen).
+
+## Shelf locations
+
+Every book can record where it physically lives: which shelf, and which slot on
+it. Column 1, row 1 is the top left.
+
+Shelves are **data, not constants** — name and size live in a `shelves` table and
+are edited on the **Bookshelf** tab, so a second bookcase or a different size never
+needs a redeploy. One 6×8 shelf is seeded on first start; change
+`DEFAULT_SHELF_COLUMNS` / `DEFAULT_SHELF_ROWS` to seed a different size.
+
+Books carry `shelf_id`, `shelf_column` and `shelf_row`, all nullable and all set
+together. The **Bookshelf** tab draws each shelf and lists what is in a slot when
+you click it, which is the quickest way to see what is where. Books can be
+**dragged onto a slot** to move them, and with more than one shelf, dragging over
+a shelf's name switches to it so a book can be moved between shelves in one
+gesture. Drag and drop is a mouse affordance — on a touch screen use the
+**Move** button, which opens the same picker. In the Manage tab
+the **Location** column opens a picker: click a slot on the shelf, or type the
+numbers. Slots already holding a book are shaded, and the picker lists what is
+there before you save.
+
+A few behaviours worth knowing:
+
+- **Two books may share a slot.** Thin books pair up and shelves get reshuffled,
+  so this is an ordinary situation rather than an error. The picker lists what is
+  already in the slot for information; nothing blocks the save.
+- **Shrinking a shelf is refused** while books sit in the slots that would be cut
+  off, and says how many. Losing a position silently is worse than being made to
+  move the books first.
+- **Deleting a shelf unplaces its books**, never deletes them. The confirmation
+  says how many are affected.
+- **An edit that never mentions the location leaves it alone.** `PUT /books/{id}`
+  distinguishes an absent location from an explicit null, so renaming a book from
+  the table cannot quietly unshelve it.
+
+`/books` gains `?shelf_id=` and `?placed=false` (books with no location yet, for
+working through a backlog), plus `sort=location`, which puts unplaced books last.
 
 ## Google Books fallback
 

@@ -450,6 +450,488 @@ function TagsCell({book, onChanged, onError}){
   )
 }
 
+// --- shelves ---
+
+/// A clickable shelf. Used for placing a book, and for showing where one lives.
+/// Pass onDropBook to accept books dragged onto a slot.
+function ShelfGrid({shelf, slots, selected, onSelect, highlight, excludeBookId, onDropBook, dragActive}){
+  const [hover,setHover] = useState(null)
+  if(!shelf) return null
+  const occupied = {}
+  ;(slots||[]).forEach(s=>{
+    const key = `${s.column},${s.row}`
+    ;(occupied[key] = occupied[key] || []).push(s)
+  })
+
+  const cells = []
+  for(let r=1; r<=shelf.rows; r++){
+    for(let c=1; c<=shelf.columns; c++){
+      const key = `${c},${r}`
+      const here = (occupied[key] || []).filter(s=> s.book_id !== excludeBookId)
+      const isSelected = selected && selected.column===c && selected.row===r
+      const isHighlight = highlight && highlight.column===c && highlight.row===r
+      const names = here.map(s=> s.title).join('\n')
+      const dropProps = onDropBook ? {
+        // preventDefault on dragover is what actually marks a element as a
+        // valid drop target; without it the browser refuses the drop.
+        onDragOver: (e)=>{ e.preventDefault(); e.dataTransfer.dropEffect = 'move' },
+        onDragEnter: ()=> setHover(key),
+        onDragLeave: ()=> setHover(h=> h===key ? null : h),
+        onDrop: (e)=>{
+          e.preventDefault()
+          setHover(null)
+          const id = Number(e.dataTransfer.getData('text/plain'))
+          if(id) onDropBook(id, c, r)
+        }
+      } : {}
+      cells.push(
+        <button key={key} type="button" {...dropProps}
+                className={['shelf-slot', here.length? 'occupied':'', isSelected? 'selected':'',
+                            isHighlight? 'highlight':'', dragActive? 'droppable':'',
+                            hover===key? 'drop-hover':''].filter(Boolean).join(' ')}
+                onClick={onSelect? ()=>onSelect(c, r) : undefined}
+                disabled={!onSelect && !onDropBook}
+                title={here.length? `Column ${c}, row ${r}\n${names}` : `Column ${c}, row ${r} — empty`}>
+          <span className="shelf-slot-coord">{c},{r}</span>
+          {here.length>0 && <span className="shelf-slot-books">{here.length>1? here.length+' books' : here[0].title}</span>}
+        </button>
+      )
+    }
+  }
+  return (
+    <div className="shelf-grid" style={{gridTemplateColumns:`repeat(${shelf.columns},minmax(0,1fr))`}}>
+      {cells}
+    </div>
+  )
+}
+
+/// Modal for placing one book: pick a shelf, click a slot or type the numbers.
+function ShelfPicker({book, shelves, onClose, onSaved}){
+  const firstId = book.shelf_id || (shelves[0] && shelves[0].id) || null
+  const [shelfId,setShelfId] = useState(firstId)
+  const [col,setCol] = useState(book.shelf_column || '')
+  const [row,setRow] = useState(book.shelf_row || '')
+  const [layout,setLayout] = useState(null)
+  const [busy,setBusy] = useState(false)
+  const [error,setError] = useState(null)
+
+  const shelf = (layout && layout.shelf) || shelves.find(s=> s.id===shelfId)
+
+  useEffect(()=>{
+    let cancelled = false
+    if(!shelfId){ setLayout(null); return }
+    ;(async ()=>{
+      try{
+        const res = await fetch(`${API_BASE}/shelves/${shelfId}/layout`, {headers: authHeaders()})
+        if(res.ok && !cancelled) setLayout(await res.json())
+      }catch(err){ if(!cancelled) setError(friendlyMessage(err.message)) }
+    })()
+    return ()=>{ cancelled = true }
+  }, [shelfId])
+
+  const pick = (c, r)=>{ setCol(c); setRow(r); setError(null) }
+
+  // Show what else is already in the chosen slot, so a clash is visible before
+  // saving rather than silently allowed.
+  const clash = (layout && col && row)
+    ? (layout.slots || []).filter(s=> s.column===Number(col) && s.row===Number(row) && s.book_id!==book.id)
+    : []
+
+  const submit = async (body)=>{
+    setBusy(true); setError(null)
+    try{
+      const res = await fetch(`${API_BASE}/books/${book.id}/location`, {
+        method:'PUT', headers: authHeaders(true), body: JSON.stringify(body)})
+      if(!res.ok){ setError(await readError(res)); setBusy(false); return }
+      onSaved(await res.json())
+      onClose()
+    }catch(err){ setError(friendlyMessage(err.message)) }
+    setBusy(false)
+  }
+
+  const save = ()=> submit((col && row && shelfId)
+    ? {shelf_id: shelfId, shelf_column: Number(col), shelf_row: Number(row)}
+    : {})
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal" onClick={e=> e.stopPropagation()}>
+        <h3 style={{marginTop:0}}>Where is “{book.title}”?</h3>
+        {error && <div className="alert">{error}</div>}
+
+        {shelves.length===0 ? (
+          <div style={{color:'#666'}}>No shelves yet — add one on the Shelves tab first.</div>
+        ) : (
+          <>
+            <label>Shelf
+              <select value={shelfId || ''} onChange={e=>{ setShelfId(Number(e.target.value)); setCol(''); setRow('') }}>
+                {shelves.map(s=> <option key={s.id} value={s.id}>{s.name} ({s.columns}×{s.rows})</option>)}
+              </select>
+            </label>
+
+            <div className="shelf-frame">
+              <ShelfGrid shelf={shelf} slots={layout && layout.slots}
+                         selected={col && row ? {column:Number(col), row:Number(row)} : null}
+                         onSelect={pick} excludeBookId={book.id} />
+            </div>
+
+            <div className="search-row" style={{marginTop:10,alignItems:'flex-end'}}>
+              <label style={{margin:0,flex:'0 0 auto'}}>Column
+                <input type="number" min="1" max={shelf? shelf.columns : 99} value={col}
+                       style={{width:90}} onChange={e=> setCol(e.target.value)} />
+              </label>
+              <label style={{margin:0,flex:'0 0 auto'}}>Row
+                <input type="number" min="1" max={shelf? shelf.rows : 99} value={row}
+                       style={{width:90}} onChange={e=> setRow(e.target.value)} />
+              </label>
+            </div>
+
+            {clash.length>0 && (
+              <div className="notice">
+                Also in this slot: {clash.map(s=> s.title).join(', ')}
+              </div>
+            )}
+          </>
+        )}
+
+        <div style={{display:'flex',gap:8,marginTop:14,flexWrap:'wrap'}}>
+          <button type="button" className="primary" onClick={save} disabled={busy || !shelves.length}>
+            {busy? 'Saving...' : 'Save location'}
+          </button>
+          {book.shelf_id && <button type="button" onClick={()=> submit({})} disabled={busy}>Remove location</button>}
+          <button type="button" onClick={onClose} style={{marginLeft:'auto'}}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/// A plain cover thumbnail, for lists that do not need the edit controls.
+function CoverThumb({book, width=34}){
+  const height = Math.round(width * 4 / 3)
+  if(!book.has_cover){
+    return <div className="cover-thumb cover-thumb-empty" style={{width, height, fontSize:9}}>—</div>
+  }
+  return <img className="cover-thumb" style={{width, height}} src={coverUrl(book, 0)} alt="" />
+}
+
+/// Browse a shelf: see it drawn, click a slot to see what is in it.
+function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
+  const [shelfId,setShelfId] = useState(shelves[0] ? shelves[0].id : null)
+  const [books,setBooks] = useState([])
+  const [selected,setSelected] = useState(null)
+  const [loading,setLoading] = useState(false)
+  const [error,setError] = useState(null)
+  const [dragging,setDragging] = useState(null)
+
+  // Keep a valid shelf selected as shelves come and go.
+  useEffect(()=>{
+    if(!shelves.length){ setShelfId(null); return }
+    if(!shelves.some(s=> s.id===shelfId)) setShelfId(shelves[0].id)
+  }, [shelves])
+
+  // A slot number means nothing once the shelf changes, and could point outside
+  // a smaller one.
+  useEffect(()=>{ setSelected(null) }, [shelfId])
+
+  useEffect(()=>{
+    let cancelled = false
+    if(!shelfId){ setBooks([]); return }
+    setLoading(true)
+    ;(async ()=>{
+      try{
+        const res = await fetch(`${API_BASE}/books?shelf_id=${shelfId}&sort=location&dir=asc`, {headers: authHeaders()})
+        if(!res.ok){ if(!cancelled) setError(await readError(res)); return }
+        if(!cancelled){ setBooks(await res.json()); setError(null) }
+      }catch(err){ if(!cancelled) setError(friendlyMessage(err.message)) }
+      finally{ if(!cancelled) setLoading(false) }
+    })()
+    return ()=>{ cancelled = true }
+  }, [shelfId, refreshToken])
+
+  const shelf = shelves.find(s=> s.id===shelfId)
+  // The books themselves carry their position, so occupancy needs no extra call.
+  const slots = books
+    .filter(b=> b.shelf_column && b.shelf_row)
+    .map(b=> ({column: b.shelf_column, row: b.shelf_row, book_id: b.id, title: b.title}))
+
+  const inSlot = selected
+    ? books.filter(b=> b.shelf_column===selected.column && b.shelf_row===selected.row)
+    : []
+
+  /// Drop handler: move a book to a slot on the shelf being viewed. Works
+  /// across shelves too, since hovering a shelf tab mid-drag switches to it.
+  const moveBook = async (bookId, column, row)=>{
+    const book = books.find(b=> b.id===bookId)
+    setDragging(null)
+    // A book dragged from another shelf will not be in this list; only skip
+    // when we can see it is already exactly here.
+    if(book && book.shelf_id===shelfId && book.shelf_column===column && book.shelf_row===row) return
+    setError(null)
+    try{
+      const res = await fetch(`${API_BASE}/books/${bookId}/location`, {
+        method:'PUT', headers: authHeaders(true),
+        body: JSON.stringify({shelf_id: shelfId, shelf_column: column, shelf_row: row})})
+      if(!res.ok){ setError(await readError(res)); return }
+      const updated = await res.json()
+      setBooks(prev=> prev.some(b=> b.id===updated.id)
+        ? prev.map(b=> b.id===updated.id ? updated : b)
+        : [...prev, updated])
+      // Follow the book, so it is obvious where it landed.
+      setSelected({column, row})
+      if(onMoved) onMoved(updated)
+    }catch(err){ setError(friendlyMessage(err.message)) }
+  }
+
+  if(!shelves.length){
+    return <div className="card"><h3>Bookshelf</h3>
+      <div style={{color:'#666'}}>No shelves yet — add one below to get started.</div></div>
+  }
+
+  return (
+    <div className="card" style={{minWidth:0}}>
+      <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <h3 style={{margin:0}}>Bookshelf</h3>
+        {shelves.length>1 && (
+          <div className="shelf-tabs">
+            {shelves.map(s=> (
+              <button key={s.id} type="button"
+                      className={s.id===shelfId ? 'shelf-tab active' : 'shelf-tab'}
+                      onClick={()=>{ setShelfId(s.id); setSelected(null) }}
+                      // Hovering a shelf while dragging switches to it, which is
+                      // what makes moving a book between shelves possible.
+                      onDragOver={e=>{
+                        e.preventDefault()
+                        if(dragging && s.id!==shelfId){ setShelfId(s.id); setSelected(null) }
+                      }}>
+                {s.name}
+              </button>
+            ))}
+          </div>
+        )}
+        <span style={{marginLeft:'auto',color:'#666',fontSize:13}}>
+          {loading ? 'Loading...' : `${books.length} book${books.length===1?'':'s'} on ${shelf? shelf.name : 'this shelf'}`}
+        </span>
+      </div>
+
+      {error && <div className="alert" style={{marginTop:8}}>{error}</div>}
+
+      <div className="shelf-browse">
+        <div className="shelf-frame" style={{flex:'1 1 320px'}}>
+          <ShelfGrid shelf={shelf} slots={slots}
+                     selected={selected}
+                     onSelect={(c,r)=> setSelected({column:c, row:r})}
+                     onDropBook={moveBook}
+                     dragActive={!!dragging} />
+        </div>
+
+        <div className="slot-detail">
+          {!selected ? (
+            <div className="slot-detail-empty">Click a slot to see what is there.</div>
+          ) : (
+            <>
+              <div className="slot-detail-head">
+                <strong>Column {selected.column}, row {selected.row}</strong>
+                <span>{inSlot.length? `${inSlot.length} book${inSlot.length===1?'':'s'}` : 'Empty'}</span>
+              </div>
+              {inSlot.length>0 && (
+                <div className="drag-hint">
+                  Drag a book onto a slot to move it{shelves.length>1 ? ', or onto a shelf name to move it there' : ''}.
+                </div>
+              )}
+              {inSlot.length===0 && <div className="slot-detail-empty">Nothing here yet.</div>}
+              {inSlot.map(b=> (
+                <div key={b.id}
+                     className={dragging===b.id ? 'slot-book dragging' : 'slot-book'}
+                     draggable
+                     onDragStart={e=>{
+                       e.dataTransfer.setData('text/plain', String(b.id))
+                       e.dataTransfer.effectAllowed = 'move'
+                       setDragging(b.id)
+                     }}
+                     onDragEnd={()=> setDragging(null)}>
+                  <span className="drag-handle" title="Drag onto a slot to move this book">⠿</span>
+                  <CoverThumb book={b} width={34} />
+                  <div style={{minWidth:0,flex:1}}>
+                    <div className="slot-book-title">{b.title}</div>
+                    {b.author && <div className="slot-book-author">{b.author}</div>}
+                    {b.tags && b.tags.length>0 && (
+                      <div className="slot-book-tags">{b.tags.slice(0,3).join(' · ')}</div>
+                    )}
+                  </div>
+                  <div className="nowrap">
+                    <button type="button" onClick={()=> onPlace(b)}>Move</button>
+                    <button type="button" onClick={()=> onDelete(b)} style={{marginLeft:6}}>Delete</button>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/// Managing the shelves themselves: add, rename, resize, delete.
+function ShelvesPanel({shelves, onChanged}){
+  const [error,setError] = useState(null)
+  const [busy,setBusy] = useState(false)
+  const [editingId,setEditingId] = useState(null)
+  const [edit,setEdit] = useState({name:'', columns:6, rows:8})
+  const [draft,setDraft] = useState({name:'', columns:6, rows:8})
+  const [preview,setPreview] = useState(null)
+
+  const call = async (url, options)=>{
+    setBusy(true); setError(null)
+    try{
+      const res = await fetch(url, options)
+      if(!res.ok){ setError(await readError(res)); setBusy(false); return null }
+      const body = res.status===200 ? await res.json() : null
+      await onChanged()
+      setBusy(false)
+      return body
+    }catch(err){ setError(friendlyMessage(err.message)); setBusy(false); return null }
+  }
+
+  const add = async ()=>{
+    const name = t(draft.name)
+    if(!name){ setError('Give the shelf a name'); return }
+    const created = await call(`${API_BASE}/shelves`, {
+      method:'POST', headers: authHeaders(true),
+      body: JSON.stringify({name, columns: Number(draft.columns), rows: Number(draft.rows)})})
+    if(created) setDraft({name:'', columns:6, rows:8})
+  }
+
+  const startEdit = (s)=>{ setEditingId(s.id); setEdit({name:s.name, columns:s.columns, rows:s.rows}); setError(null) }
+
+  const saveEdit = async (s)=>{
+    const name = t(edit.name)
+    if(!name){ setError('Give the shelf a name'); return }
+    const saved = await call(`${API_BASE}/shelves/${s.id}`, {
+      method:'PUT', headers: authHeaders(true),
+      body: JSON.stringify({name, columns: Number(edit.columns), rows: Number(edit.rows), sort_order: s.sort_order})})
+    if(saved) setEditingId(null)
+  }
+
+  const remove = async (s)=>{
+    const warning = s.book_count
+      ? `\n\n${s.book_count} book${s.book_count===1?'':'s'} will lose their location. The books themselves are kept.`
+      : ''
+    if(!confirm(`Delete “${s.name}”?${warning}`)) return
+    await call(`${API_BASE}/shelves/${s.id}`, {method:'DELETE', headers: authHeaders()})
+  }
+
+  return (
+    <div className="card" style={{minWidth:0}}>
+      <h3>Shelves</h3>
+      {error && <div className="alert">{error}</div>}
+
+      <table className="books">
+        <thead><tr><th>Name</th><th>Size</th><th>Books</th><th></th></tr></thead>
+        <tbody>
+          {shelves.map(s=> (
+            <tr key={s.id}>
+              {editingId===s.id ? (
+                <>
+                  <td><input value={edit.name} onChange={e=> setEdit({...edit, name:e.target.value})} /></td>
+                  <td className="nowrap">
+                    <input type="number" min="1" max="50" value={edit.columns} style={{width:70}}
+                           onChange={e=> setEdit({...edit, columns:e.target.value})} />
+                    {' × '}
+                    <input type="number" min="1" max="50" value={edit.rows} style={{width:70}}
+                           onChange={e=> setEdit({...edit, rows:e.target.value})} />
+                  </td>
+                  <td>{s.book_count}</td>
+                  <td className="nowrap">
+                    <button onClick={()=> saveEdit(s)} disabled={busy}>Save</button>
+                    <button onClick={()=> setEditingId(null)} style={{marginLeft:6}}>Cancel</button>
+                  </td>
+                </>
+              ) : (
+                <>
+                  <td>{s.name}</td>
+                  <td className="nowrap">{s.columns} × {s.rows} <span style={{color:'#999'}}>({s.columns*s.rows} slots)</span></td>
+                  <td>{s.book_count}</td>
+                  <td className="nowrap">
+                    <button onClick={()=> setPreview(preview===s.id ? null : s.id)}>{preview===s.id? 'Hide':'View'}</button>
+                    <button onClick={()=> startEdit(s)} style={{marginLeft:6}}>Edit</button>
+                    <button onClick={()=> remove(s)} style={{marginLeft:6}} disabled={busy}>Delete</button>
+                  </td>
+                </>
+              )}
+            </tr>
+          ))}
+          {shelves.length===0 && <tr><td colSpan={4} style={{color:'#666'}}>No shelves yet.</td></tr>}
+        </tbody>
+      </table>
+
+      {preview && <ShelfPreview shelfId={preview} />}
+
+      <h4 style={{marginBottom:6}}>Add a shelf</h4>
+      <div className="search-row" style={{alignItems:'flex-end'}}>
+        <label style={{margin:0,flex:'1 1 160px'}}>Name
+          <input value={draft.name} placeholder="Landing bookcase"
+                 onChange={e=> setDraft({...draft, name:e.target.value})} />
+        </label>
+        <label style={{margin:0,flex:'0 0 auto'}}>Columns
+          <input type="number" min="1" max="50" value={draft.columns} style={{width:90}}
+                 onChange={e=> setDraft({...draft, columns:e.target.value})} />
+        </label>
+        <label style={{margin:0,flex:'0 0 auto'}}>Rows
+          <input type="number" min="1" max="50" value={draft.rows} style={{width:90}}
+                 onChange={e=> setDraft({...draft, rows:e.target.value})} />
+        </label>
+        <button type="button" className="primary" onClick={add} disabled={busy}>Add shelf</button>
+      </div>
+      <div style={{marginTop:8,fontSize:12,color:'#666'}}>
+        Column 1, row 1 is the top left. Shrinking a shelf is refused while books
+        sit in the slots that would be cut off.
+      </div>
+    </div>
+  )
+}
+
+/// Read-only look at what is on a shelf.
+function ShelfPreview({shelfId}){
+  const [layout,setLayout] = useState(null)
+  useEffect(()=>{
+    let cancelled = false
+    ;(async ()=>{
+      const res = await fetch(`${API_BASE}/shelves/${shelfId}/layout`, {headers: authHeaders()})
+      if(res.ok && !cancelled) setLayout(await res.json())
+    })()
+    return ()=>{ cancelled = true }
+  }, [shelfId])
+  if(!layout) return null
+  return (
+    <div className="shelf-frame" style={{marginTop:10}}>
+      <ShelfGrid shelf={layout.shelf} slots={layout.slots} />
+    </div>
+  )
+}
+
+/// The location cell in the books table: shows where a book is, and opens the
+/// picker. Editing happens in the modal rather than inline, because a position
+/// is three linked values and a free-text cell cannot validate them.
+function LocationCell({book, shelves, onPlace}){
+  const shelf = (shelves || []).find(s=> s.id === book.shelf_id)
+  const placed = book.shelf_id && book.shelf_column && book.shelf_row
+  return (
+    <button type="button" className={placed? 'location-btn placed' : 'location-btn'}
+            onClick={()=> onPlace(book)}
+            title={placed? `${shelf? shelf.name : 'Shelf'} — column ${book.shelf_column}, row ${book.shelf_row}`
+                         : 'Set where this book lives'}>
+      {placed
+        ? <>
+            <span className="location-shelf">{shelf? shelf.name : 'Shelf'}</span>
+            <span className="location-coord">{book.shelf_column},{book.shelf_row}</span>
+          </>
+        : <span className="location-empty">Place</span>}
+    </button>
+  )
+}
+
 function SourcesCell({book, onChanged, onError}){
   const [busy,setBusy]=useState(null)
 
@@ -500,7 +982,7 @@ function SortHeader({label, field, sort, onSort}){
   )
 }
 
-function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort}){
+function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace}){
   const [editingId, setEditingId] = useState(null)
   const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', added:'', addedOriginal:''})
   const [rowError, setRowError] = useState(null)
@@ -551,6 +1033,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
           <SortHeader label="Author" field="author" sort={sort} onSort={onSort} />
           <th>ISBN</th>
           <th>Sources</th>
+          <SortHeader label="Location" field="location" sort={sort} onSort={onSort} />
           <th>Tags</th>
           <th className="col-notes">Notes</th>
           <SortHeader label="Added" field="added" sort={sort} onSort={onSort} />
@@ -569,6 +1052,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                     <input value={editVals.olid} placeholder="OL12345M" onChange={e=>setEditVals({...editVals, olid: e.target.value})} />
                     <input style={{marginTop:4}} value={editVals.googleId} placeholder="otCEEQAAQBAJ" onChange={e=>setEditVals({...editVals, googleId: e.target.value})} />
                   </td>
+                  <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
                   <td><input value={editVals.tags} placeholder="comma, separated, tags" onChange={e=>setEditVals({...editVals, tags: e.target.value})} /></td>
                   <td className="col-notes"><input value={editVals.notes} onChange={e=>setEditVals({...editVals, notes: e.target.value})} /></td>
                   <td><input type="date" value={editVals.added} onChange={e=>setEditVals({...editVals, added: e.target.value})} /></td>
@@ -583,6 +1067,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   <td className="col-author">{b.author}</td>
                   <td>{b.isbn}</td>
                   <td><SourcesCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
+                  <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
                   <td><TagsCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
                   <td className="col-notes">{b.notes}</td>
                   <td className="nowrap">{formatAdded(b.created_at)}</td>
@@ -613,8 +1098,17 @@ export default function App(){
   const [selectedTags,setSelectedTags]=useState([])
   const [tagMatch,setTagMatch]=useState('any')
   const [refreshing,setRefreshing]=useState(null)
+  const [shelves,setShelves]=useState([])
+  const [placing,setPlacing]=useState(null)
+  // Bumped whenever a location changes, so the bookshelf browser refetches.
+  const [locationVersion,setLocationVersion]=useState(0)
 
   const sortNewestFirst = (list)=> Array.isArray(list) ? [...list].sort((a,b)=> (b.id||0)-(a.id||0)) : []
+
+  const fetchShelves = async ()=>{
+    const res = await fetch(API_BASE + '/shelves', {headers: authHeaders()})
+    if(res.ok) setShelves(await res.json())
+  }
 
   const fetchTags = async ()=>{
     const res = await fetch(API_BASE + '/tags', {headers: authHeaders()})
@@ -681,7 +1175,7 @@ export default function App(){
     fetchTags()
   }
 
-  useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags() } }, [loggedIn])
+  useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves() } }, [loggedIn])
 
   const setUndoWithTimeout = (u)=>{
     if(undoTimer) clearTimeout(undoTimer)
@@ -698,13 +1192,13 @@ export default function App(){
     if(!undo) return
     try{
       if(undo.type==='delete'){
-        const res = await fetch(API_BASE + '/books', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
+        const res = await fetch(API_BASE + '/books', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
         if(res.ok){
           const restored = await res.json()
           if(undo.wasRecent) setRecent(prev=> sortNewestFirst([restored, ...prev]))
         }
       } else if(undo.type==='update'){
-        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
+        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
         if(res.ok){
           const reverted = await res.json()
           setRecent(prev=> prev.map(x=> x.id===reverted.id ? reverted : x))
@@ -718,6 +1212,8 @@ export default function App(){
     }catch(e){ console.error('Undo failed', e) }
     clearUndo()
     fetchBooks()
+    fetchShelves()
+    setLocationVersion(v=> v+1)
   }
 
   const handleDelete = async (book)=>{
@@ -729,6 +1225,8 @@ export default function App(){
     setUndoWithTimeout({type:'delete', book, wasRecent})
     fetchBooks()
     fetchTags()
+    fetchShelves()
+    setLocationVersion(v=> v+1)
   }
 
   const onAdded = (created)=>{
@@ -770,17 +1268,30 @@ export default function App(){
 
       {!loggedIn ? <Login onLogin={()=>setLoggedIn(true)} /> : (
         <>
+          {placing && (
+            <ShelfPicker book={placing} shelves={shelves}
+                         onClose={()=> setPlacing(null)}
+                         onSaved={(updated)=>{ onBookPatched(updated); fetchShelves(); setLocationVersion(v=> v+1) }} />
+          )}
           <div className="tabs">
             <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>
-            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags() }}>Manage</button>
+            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves() }}>Manage</button>
+            <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>
           </div>
 
-          {tab==='add' ? (
+          {tab==='shelves' ? (
+            <>
+              <BookshelfBrowser shelves={shelves} refreshToken={locationVersion}
+                                onPlace={setPlacing} onDelete={handleDelete}
+                                onMoved={(updated)=>{ onBookPatched(updated); fetchShelves() }} />
+              <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks(); setLocationVersion(v=> v+1) }} />
+            </>
+          ) : tab==='add' ? (
             <>
               <AddForm onAdded={onAdded} />
               <div className="card" style={{minWidth:0}}>
                 <h3>Recently added this session</h3>
-                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
+                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
               </div>
             </>
           ) : (
@@ -795,7 +1306,7 @@ export default function App(){
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}
                          onRefreshAll={books.length ? refreshAllTags : null} refreshing={refreshing} />
               <div style={{margin:'8px 0',color:'#666',fontSize:13}}>{books.length} book{books.length===1?'':'s'}</div>
-              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} emptyText="No books match." />
+              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} emptyText="No books match." />
             </div>
           )}
         </>
