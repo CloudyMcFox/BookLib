@@ -27,6 +27,13 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "").strip()
 GOOGLE_BOOKS_ENABLED = os.environ.get("GOOGLE_BOOKS_ENABLED", "true").strip().lower() not in ("0", "false", "no")
 
+# Shelf defaults, used only for the shelf seeded on first start. Shelves are
+# data, so sizes are edited through the API rather than by redeploying.
+DEFAULT_SHELF_COLUMNS = int(os.environ.get("DEFAULT_SHELF_COLUMNS", 6))
+DEFAULT_SHELF_ROWS = int(os.environ.get("DEFAULT_SHELF_ROWS", 8))
+# Sanity limits so a typo cannot ask the UI to draw a million slots.
+MAX_SHELF_DIMENSION = 50
+
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
@@ -117,6 +124,11 @@ class Book(BaseModel):
     # the volume record instead of searching for it first.
     google_id: Optional[str] = None
     notes: Optional[str] = None
+    # Physical location. All three travel together: a shelf without a slot, or a
+    # slot without a shelf, is not a position.
+    shelf_id: Optional[int] = None
+    shelf_column: Optional[int] = None
+    shelf_row: Optional[int] = None
     # Omit on PUT to leave a book's tags untouched; send a list to replace them.
     tags: Optional[List[str]] = None
     # ISO-8601 UTC timestamp of when the book was added (NULL for rows created
@@ -141,6 +153,32 @@ def book_from_row(row, tags: Optional[List[str]] = None) -> Book:
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+
+class Shelf(BaseModel):
+    id: Optional[int] = None
+    name: str
+    columns: int = DEFAULT_SHELF_COLUMNS
+    rows: int = DEFAULT_SHELF_ROWS
+    sort_order: int = 0
+    created_at: Optional[str] = None
+    # Read-only: how many books are placed on this shelf.
+    book_count: int = 0
+
+
+class ShelfSlot(BaseModel):
+    """One occupied slot, for drawing a shelf with its contents."""
+    column: int
+    row: int
+    book_id: int
+    title: str
+    author: Optional[str] = None
+    has_cover: bool = False
+
+
+class ShelfLayout(BaseModel):
+    shelf: Shelf
+    slots: List[ShelfSlot] = []
 
 class UserCreate(BaseModel):
     username: str
@@ -174,6 +212,15 @@ conn.execute("""CREATE TABLE IF NOT EXISTS book_tags (
 )
 """)
 conn.execute("CREATE INDEX IF NOT EXISTS idx_book_tags_tag ON book_tags(tag_id)")
+conn.execute("""CREATE TABLE IF NOT EXISTS shelves (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    columns INTEGER NOT NULL,
+    rows INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT
+)
+""")
 conn.commit()
 
 # --- lightweight migration: add cover columns to pre-existing databases ---
@@ -196,10 +243,26 @@ if 'olid' not in _existing_cols:
         conn.execute("UPDATE books SET olid=?, notes=? WHERE id=?", (m.group(0), remaining or None, row['id']))
 if 'google_id' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN google_id TEXT")
+# Physical location: which shelf, and which slot on it. All three are set
+# together or all are null — a book with a shelf but no slot is meaningless.
+if 'shelf_id' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN shelf_id INTEGER")
+if 'shelf_column' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN shelf_column INTEGER")
+if 'shelf_row' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN shelf_row INTEGER")
+conn.execute("CREATE INDEX IF NOT EXISTS idx_books_shelf ON books(shelf_id)")
+
+# Seed one shelf so the feature works out of the box rather than presenting an
+# empty picker on first use.
+if not conn.execute("SELECT 1 FROM shelves LIMIT 1").fetchone():
+    conn.execute("INSERT INTO shelves (name, columns, rows, sort_order, created_at) VALUES (?,?,?,?,?)",
+                 ("Bookshelf", DEFAULT_SHELF_COLUMNS, DEFAULT_SHELF_ROWS, 0,
+                  datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')))
 conn.commit()
 
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
-BOOK_COLUMNS = "id, title, author, isbn, olid, google_id, notes, created_at, length(cover) AS cover_size"
+BOOK_COLUMNS = "id, title, author, isbn, olid, google_id, notes, created_at, shelf_id, shelf_column, shelf_row, length(cover) AS cover_size"
 
 # Whitelisted ORDER BY clauses, so the sort parameter can never be injected.
 # Books added before created_at existed sort by id, which preserves insert order.
@@ -207,6 +270,9 @@ SORT_CLAUSES = {
     'title': "title COLLATE NOCASE {dir}, id {dir}",
     'author': "CASE WHEN author IS NULL OR author='' THEN 1 ELSE 0 END, author COLLATE NOCASE {dir}, id {dir}",
     'added': "COALESCE(created_at,'') {dir}, id {dir}",
+    # Unplaced books sort last either way, so the list does not open on a block
+    # of blanks.
+    'location': "CASE WHEN shelf_id IS NULL THEN 1 ELSE 0 END, shelf_id {dir}, shelf_row {dir}, shelf_column {dir}, id {dir}",
 }
 DEFAULT_SORT = 'added'
 
@@ -219,6 +285,49 @@ def order_by(sort: Optional[str], direction: Optional[str]) -> str:
 
 def now_iso() -> str:
     return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+# --- shelf helpers ---
+def shelf_row_to_model(row, book_count: int = 0) -> Shelf:
+    return Shelf(id=row['id'], name=row['name'], columns=row['columns'], rows=row['rows'],
+                 sort_order=row['sort_order'], created_at=row['created_at'], book_count=book_count)
+
+
+def get_shelf(shelf_id: int):
+    return conn.execute("SELECT * FROM shelves WHERE id=?", (shelf_id,)).fetchone()
+
+
+def validate_shelf_size(columns: int, rows: int):
+    if columns < 1 or rows < 1:
+        raise HTTPException(status_code=400, detail="A shelf needs at least one column and one row")
+    if columns > MAX_SHELF_DIMENSION or rows > MAX_SHELF_DIMENSION:
+        raise HTTPException(status_code=400,
+                            detail=f"A shelf can be at most {MAX_SHELF_DIMENSION} columns by {MAX_SHELF_DIMENSION} rows")
+
+
+def resolve_location(shelf_id: Optional[int], column: Optional[int], row: Optional[int]):
+    """Validate a book's location and return it as a (shelf_id, column, row)
+    triple, or (None, None, None) when the book is unplaced.
+
+    The three values only mean anything together, so a partial location is
+    rejected rather than half-stored."""
+    supplied = [v for v in (shelf_id, column, row) if v is not None]
+    if not supplied:
+        return None, None, None
+    if len(supplied) != 3:
+        raise HTTPException(status_code=400,
+                            detail="A location needs a shelf, a column and a row — or none of the three")
+
+    shelf = get_shelf(shelf_id)
+    if not shelf:
+        raise HTTPException(status_code=400, detail="No such shelf")
+    if not (1 <= column <= shelf['columns']):
+        raise HTTPException(status_code=400,
+                            detail=f"Column must be between 1 and {shelf['columns']} on “{shelf['name']}”")
+    if not (1 <= row <= shelf['rows']):
+        raise HTTPException(status_code=400,
+                            detail=f"Row must be between 1 and {shelf['rows']} on “{shelf['name']}”")
+    return shelf_id, column, row
 
 
 # --- tag helpers ---
@@ -910,9 +1019,11 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
 @app.get("/books", response_model=List[Book])
 def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optional[str] = None,
                tags: Optional[str] = None, match: Optional[str] = None,
+               shelf_id: Optional[int] = None, placed: Optional[bool] = None,
                current_user: dict = Depends(get_current_user)):
     """List books. Optional ?q= search, ?sort=title|author|added, ?dir=asc|desc,
-    and ?tags=a,b with ?match=any|all (default any)."""
+    ?tags=a,b with ?match=any|all (default any), ?shelf_id= to limit to one
+    shelf, and ?placed=false to find books with no location yet."""
     order = order_by(sort, dir)
     where = []
     params: List = []
@@ -920,6 +1031,13 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         pattern = f"%{q.strip()}%"
         where.append("(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR olid LIKE ?)")
         params.extend([pattern, pattern, pattern, pattern])
+
+    if shelf_id is not None:
+        where.append("shelf_id = ?")
+        params.append(shelf_id)
+
+    if placed is not None:
+        where.append("shelf_id IS NOT NULL" if placed else "shelf_id IS NULL")
 
     wanted = normalize_tags((tags or '').split(','))
     if wanted:
@@ -940,6 +1058,87 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     grouped = tags_for_books([r['id'] for r in rows])
     return [book_from_row(r, grouped.get(r['id'], [])) for r in rows]
 
+@app.get("/shelves", response_model=List[Shelf])
+def list_shelves(current_user: dict = Depends(get_current_user)):
+    counts = {r['shelf_id']: r['n'] for r in conn.execute(
+        "SELECT shelf_id, COUNT(*) AS n FROM books WHERE shelf_id IS NOT NULL GROUP BY shelf_id")}
+    rows = conn.execute("SELECT * FROM shelves ORDER BY sort_order, id").fetchall()
+    return [shelf_row_to_model(r, counts.get(r['id'], 0)) for r in rows]
+
+
+@app.post("/shelves", response_model=Shelf)
+def add_shelf(s: Shelf, current_user: dict = Depends(get_current_user)):
+    name = clean(s.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="A shelf needs a name")
+    validate_shelf_size(s.columns, s.rows)
+    cur = conn.execute("INSERT INTO shelves (name, columns, rows, sort_order, created_at) VALUES (?,?,?,?,?)",
+                       (name, s.columns, s.rows, s.sort_order, now_iso()))
+    conn.commit()
+    return shelf_row_to_model(get_shelf(cur.lastrowid), 0)
+
+
+@app.put("/shelves/{shelf_id}", response_model=Shelf)
+def update_shelf(shelf_id: int, s: Shelf, current_user: dict = Depends(get_current_user)):
+    """Rename or resize a shelf.
+
+    Shrinking is refused when books are sitting in the slots that would be cut
+    off — losing a position silently is worse than making the user move the
+    books first."""
+    existing = get_shelf(shelf_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Not found")
+    name = clean(s.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="A shelf needs a name")
+    validate_shelf_size(s.columns, s.rows)
+
+    orphaned = conn.execute(
+        "SELECT COUNT(*) AS n FROM books WHERE shelf_id=? AND (shelf_column > ? OR shelf_row > ?)",
+        (shelf_id, s.columns, s.rows)).fetchone()['n']
+    if orphaned:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{orphaned} book{'' if orphaned == 1 else 's'} would fall outside the new size. "
+                   "Move them first, or choose a larger size.")
+
+    conn.execute("UPDATE shelves SET name=?, columns=?, rows=?, sort_order=? WHERE id=?",
+                 (name, s.columns, s.rows, s.sort_order, shelf_id))
+    conn.commit()
+    count = conn.execute("SELECT COUNT(*) AS n FROM books WHERE shelf_id=?", (shelf_id,)).fetchone()['n']
+    return shelf_row_to_model(get_shelf(shelf_id), count)
+
+
+@app.delete("/shelves/{shelf_id}")
+def delete_shelf(shelf_id: int, current_user: dict = Depends(get_current_user)):
+    """Delete a shelf. Books on it are unplaced, never deleted."""
+    if not get_shelf(shelf_id):
+        raise HTTPException(status_code=404, detail="Not found")
+    unplaced = conn.execute("SELECT COUNT(*) AS n FROM books WHERE shelf_id=?", (shelf_id,)).fetchone()['n']
+    conn.execute("UPDATE books SET shelf_id=NULL, shelf_column=NULL, shelf_row=NULL WHERE shelf_id=?", (shelf_id,))
+    conn.execute("DELETE FROM shelves WHERE id=?", (shelf_id,))
+    conn.commit()
+    return {"deleted": 1, "unplaced": unplaced}
+
+
+@app.get("/shelves/{shelf_id}/layout", response_model=ShelfLayout)
+def shelf_layout(shelf_id: int, current_user: dict = Depends(get_current_user)):
+    """A shelf plus what is currently in each slot, for drawing the picker."""
+    shelf = get_shelf(shelf_id)
+    if not shelf:
+        raise HTTPException(status_code=404, detail="Not found")
+    rows = conn.execute(
+        """SELECT id, title, author, shelf_column, shelf_row, length(cover) AS cover_size
+           FROM books WHERE shelf_id=? AND shelf_column IS NOT NULL AND shelf_row IS NOT NULL
+           ORDER BY shelf_row, shelf_column, title COLLATE NOCASE""", (shelf_id,)).fetchall()
+    count = conn.execute("SELECT COUNT(*) AS n FROM books WHERE shelf_id=?", (shelf_id,)).fetchone()['n']
+    return ShelfLayout(
+        shelf=shelf_row_to_model(shelf, count),
+        slots=[ShelfSlot(column=r['shelf_column'], row=r['shelf_row'], book_id=r['id'],
+                         title=r['title'], author=r['author'], has_cover=bool(r['cover_size'] or 0))
+               for r in rows])
+
+
 @app.get("/tags")
 def list_tags(current_user: dict = Depends(get_current_user)):
     """Every tag in use, with how many books carry it — powers the filter list."""
@@ -959,13 +1158,26 @@ def delete_book(book_id: int, current_user: dict = Depends(get_current_user)):
 @app.put("/books/{book_id}", response_model=Book)
 def update_book(book_id: int, b: Book, current_user: dict = Depends(get_current_user)):
     """Update an existing book. All fields in the payload will overwrite stored
-    values, except created_at which is only touched when a value is supplied."""
+    values, except created_at and the shelf location, which are only touched
+    when the caller actually sends them."""
     title = clean(b.title)
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
     added = clean_timestamp(b.created_at)
+    # A client editing the title should not silently unplace the book. The
+    # location is three linked fields that most callers omit entirely, so tell
+    # "absent" apart from "explicitly null" rather than assuming null means
+    # clear. Pydantic v2 exposes this as model_fields_set.
+    sent = getattr(b, 'model_fields_set', None) or getattr(b, '__fields_set__', set())
+    location_sent = bool({'shelf_id', 'shelf_column', 'shelf_row'} & set(sent))
     try:
-        conn.execute("UPDATE books SET title=?, author=?, isbn=?, olid=?, google_id=?, notes=? WHERE id=?", (title, clean(b.author), clean(b.isbn), clean_olid(b.olid), clean_google_id(b.google_id), clean(b.notes), book_id))
+        conn.execute("UPDATE books SET title=?, author=?, isbn=?, olid=?, google_id=?, notes=? WHERE id=?",
+                     (title, clean(b.author), clean(b.isbn), clean_olid(b.olid), clean_google_id(b.google_id),
+                      clean(b.notes), book_id))
+        if location_sent:
+            location = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
+            conn.execute("UPDATE books SET shelf_id=?, shelf_column=?, shelf_row=? WHERE id=?",
+                         (location[0], location[1], location[2], book_id))
         if added:
             conn.execute("UPDATE books SET created_at=? WHERE id=?", (added, book_id))
         conn.commit()
@@ -991,8 +1203,11 @@ def add_book(b: Book, current_user: dict = Depends(get_current_user)):
     b.google_id = clean_google_id(b.google_id)
     # Allow an explicit added date (e.g. when restoring a deleted book via undo).
     b.created_at = clean_timestamp(b.created_at) or now_iso()
+    b.shelf_id, b.shelf_column, b.shelf_row = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
     try:
-        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, created_at) VALUES (?,?,?,?,?,?,?)", (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.created_at))
+        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, created_at, shelf_id, shelf_column, shelf_row) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.created_at,
+                            b.shelf_id, b.shelf_column, b.shelf_row))
         conn.commit()
         b.id = cur.lastrowid
     except sqlite3.IntegrityError as e:
@@ -1128,6 +1343,29 @@ def delete_book_cover(book_id: int, current_user: dict = Depends(get_current_use
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
     return book_from_row(row)
+
+class BookLocation(BaseModel):
+    """Body for setting a book's position. All null unplaces the book."""
+    shelf_id: Optional[int] = None
+    shelf_column: Optional[int] = None
+    shelf_row: Optional[int] = None
+
+
+@app.put("/books/{book_id}/location", response_model=Book)
+def set_book_location(book_id: int, loc: BookLocation, current_user: dict = Depends(get_current_user)):
+    """Set or clear where a book lives.
+
+    Separate from PUT /books/{id} so placing a book from the shelf picker cannot
+    clobber fields the picker never loaded."""
+    if not conn.execute("SELECT 1 FROM books WHERE id=?", (book_id,)).fetchone():
+        raise HTTPException(status_code=404, detail="Not found")
+    shelf_id, column, row = resolve_location(loc.shelf_id, loc.shelf_column, loc.shelf_row)
+    conn.execute("UPDATE books SET shelf_id=?, shelf_column=?, shelf_row=? WHERE id=?",
+                 (shelf_id, column, row, book_id))
+    conn.commit()
+    cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
+    return book_from_row(cur.fetchone())
+
 
 @app.post("/books/import")
 async def import_books(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):

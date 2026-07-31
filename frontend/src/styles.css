@@ -96,8 +96,33 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .cover-actions{display:flex;flex-direction:column;gap:4px;width:100%}
 .cover-actions button{padding:3px 6px;font-size:12px;width:100%}
 
-.snackbar{position:fixed;right:20px;bottom:20px;background:#222;color:#fff;padding:12px 14px;border-radius:6px;display:flex;gap:10px;align-items:center;z-index:50;font-size:14px}
-.snackbar button{background:transparent;border:1px solid #666;color:#fff}
+/* --- shelves --- */
+.shelf-frame{background:#2e2018;border:6px solid #3d2a1d;border-radius:6px;padding:6px;margin-top:8px;overflow-x:auto}
+.shelf-grid{display:grid;gap:4px;min-width:260px}
+.shelf-slot{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+  min-height:46px;padding:3px;border:1px solid #5a4130;border-radius:3px;background:#f6f1e7;
+  font-size:10px;line-height:1.15;overflow:hidden;text-align:center;cursor:pointer}
+.shelf-slot:disabled{cursor:default}
+.shelf-slot:hover:not(:disabled){background:#fff;border-color:#2563eb}
+.shelf-slot.occupied{background:#dbe6f5;border-color:#8fa8c8}
+.shelf-slot.selected{background:#2563eb;border-color:#1d4ed8;color:#fff;box-shadow:0 0 0 2px rgba(37,99,235,.35)}
+.shelf-slot.highlight{background:#fde68a;border-color:#d97706;box-shadow:0 0 0 2px rgba(217,119,6,.45)}
+.shelf-slot-coord{font-family:ui-monospace,Consolas,monospace;font-size:9px;opacity:.6}
+.shelf-slot.selected .shelf-slot-coord{opacity:.85}
+.shelf-slot-books{font-weight:600;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
+
+.location-btn{display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:3px 7px;font-size:12px;max-width:130px}
+.location-btn.placed{background:#eef2ff;border-color:#dbe1fb}
+.location-shelf{font-size:11px;color:#444;overflow:hidden;text-overflow:ellipsis;max-width:115px;white-space:nowrap}
+.location-coord{font-family:ui-monospace,Consolas,monospace;font-weight:600;color:#2563eb}
+.location-empty{color:#888}
+
+.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
+.modal{background:#fff;border-radius:8px;padding:16px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 10px 40px rgba(0,0,0,.3)}
+.modal select{padding:7px 8px;border:1px solid #ccd0d5;border-radius:5px;font-size:14px;width:100%}
+.notice{margin-top:8px;padding:7px 9px;border-radius:5px;background:#fff7ed;border:1px solid #fed7aa;color:#7c2d12;font-size:13px}
+
+.snackbar{position:fixed;right:20px;bottom:20px;background:#222;color:#fff;padding:12px 14px;border-radius:6px;display:flex;gap:10px;align-items:center;z-index:50;font-size:14px}.snackbar button{background:transparent;border:1px solid #666;color:#fff}
 .snackbar button:hover{background:#333}
 
 @media (max-width:600px){
