@@ -215,14 +215,16 @@ Every book can record where it physically lives: which shelf, and which slot on
 it. Column 1, row 1 is the top left.
 
 Shelves are **data, not constants** — name and size live in a `shelves` table and
-are edited on the **Shelves** tab, so a second bookcase or a different size never
+are edited on the **Bookshelf** tab, so a second bookcase or a different size never
 needs a redeploy. One 6×8 shelf is seeded on first start; change
 `DEFAULT_SHELF_COLUMNS` / `DEFAULT_SHELF_ROWS` to seed a different size.
 
 Books carry `shelf_id`, `shelf_column` and `shelf_row`, all nullable and all set
-together. In the Manage tab the **Location** column opens a picker: click a slot
-on the shelf, or type the numbers. Slots already holding a book are shaded, and
-the picker names what is there before you save.
+together. The **Bookshelf** tab draws each shelf and lists what is in a slot when
+you click it, which is the quickest way to see what is where. In the Manage tab
+the **Location** column opens a picker: click a slot on the shelf, or type the
+numbers. Slots already holding a book are shaded, and the picker lists what is
+there before you save.
 
 A few behaviours worth knowing:
 

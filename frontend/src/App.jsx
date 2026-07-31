@@ -589,6 +589,126 @@ function ShelfPicker({book, shelves, onClose, onSaved}){
   )
 }
 
+/// A plain cover thumbnail, for lists that do not need the edit controls.
+function CoverThumb({book, width=34}){
+  const height = Math.round(width * 4 / 3)
+  if(!book.has_cover){
+    return <div className="cover-thumb cover-thumb-empty" style={{width, height, fontSize:9}}>—</div>
+  }
+  return <img className="cover-thumb" style={{width, height}} src={coverUrl(book, 0)} alt="" />
+}
+
+/// Browse a shelf: see it drawn, click a slot to see what is in it.
+function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete}){
+  const [shelfId,setShelfId] = useState(shelves[0] ? shelves[0].id : null)
+  const [books,setBooks] = useState([])
+  const [selected,setSelected] = useState(null)
+  const [loading,setLoading] = useState(false)
+  const [error,setError] = useState(null)
+
+  // Keep a valid shelf selected as shelves come and go.
+  useEffect(()=>{
+    if(!shelves.length){ setShelfId(null); return }
+    if(!shelves.some(s=> s.id===shelfId)) setShelfId(shelves[0].id)
+  }, [shelves])
+
+  // A slot number means nothing once the shelf changes, and could point outside
+  // a smaller one.
+  useEffect(()=>{ setSelected(null) }, [shelfId])
+
+  useEffect(()=>{
+    let cancelled = false
+    if(!shelfId){ setBooks([]); return }
+    setLoading(true)
+    ;(async ()=>{
+      try{
+        const res = await fetch(`${API_BASE}/books?shelf_id=${shelfId}&sort=location&dir=asc`, {headers: authHeaders()})
+        if(!res.ok){ if(!cancelled) setError(await readError(res)); return }
+        if(!cancelled){ setBooks(await res.json()); setError(null) }
+      }catch(err){ if(!cancelled) setError(friendlyMessage(err.message)) }
+      finally{ if(!cancelled) setLoading(false) }
+    })()
+    return ()=>{ cancelled = true }
+  }, [shelfId, refreshToken])
+
+  const shelf = shelves.find(s=> s.id===shelfId)
+  // The books themselves carry their position, so occupancy needs no extra call.
+  const slots = books
+    .filter(b=> b.shelf_column && b.shelf_row)
+    .map(b=> ({column: b.shelf_column, row: b.shelf_row, book_id: b.id, title: b.title}))
+
+  const inSlot = selected
+    ? books.filter(b=> b.shelf_column===selected.column && b.shelf_row===selected.row)
+    : []
+
+  if(!shelves.length){
+    return <div className="card"><h3>Bookshelf</h3>
+      <div style={{color:'#666'}}>No shelves yet — add one below to get started.</div></div>
+  }
+
+  return (
+    <div className="card" style={{minWidth:0}}>
+      <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+        <h3 style={{margin:0}}>Bookshelf</h3>
+        {shelves.length>1 && (
+          <div className="shelf-tabs">
+            {shelves.map(s=> (
+              <button key={s.id} type="button"
+                      className={s.id===shelfId ? 'shelf-tab active' : 'shelf-tab'}
+                      onClick={()=>{ setShelfId(s.id); setSelected(null) }}>
+                {s.name}
+              </button>
+            ))}
+          </div>
+        )}
+        <span style={{marginLeft:'auto',color:'#666',fontSize:13}}>
+          {loading ? 'Loading...' : `${books.length} book${books.length===1?'':'s'} on ${shelf? shelf.name : 'this shelf'}`}
+        </span>
+      </div>
+
+      {error && <div className="alert" style={{marginTop:8}}>{error}</div>}
+
+      <div className="shelf-browse">
+        <div className="shelf-frame" style={{flex:'1 1 320px'}}>
+          <ShelfGrid shelf={shelf} slots={slots}
+                     selected={selected}
+                     onSelect={(c,r)=> setSelected({column:c, row:r})} />
+        </div>
+
+        <div className="slot-detail">
+          {!selected ? (
+            <div className="slot-detail-empty">Click a slot to see what is there.</div>
+          ) : (
+            <>
+              <div className="slot-detail-head">
+                <strong>Column {selected.column}, row {selected.row}</strong>
+                <span>{inSlot.length? `${inSlot.length} book${inSlot.length===1?'':'s'}` : 'Empty'}</span>
+              </div>
+              {inSlot.length===0 && <div className="slot-detail-empty">Nothing here yet.</div>}
+              {inSlot.map(b=> (
+                <div key={b.id} className="slot-book">
+                  <CoverThumb book={b} width={34} />
+                  <div style={{minWidth:0,flex:1}}>
+                    <div className="slot-book-title">{b.title}</div>
+                    {b.author && <div className="slot-book-author">{b.author}</div>}
+                    {b.tags && b.tags.length>0 && (
+                      <div className="slot-book-tags">{b.tags.slice(0,3).join(' · ')}</div>
+                    )}
+                  </div>
+                  <div className="nowrap">
+                    <button type="button" onClick={()=> onPlace(b)}>Move</button>
+                    <button type="button" onClick={()=> onDelete(b)} style={{marginLeft:6}}>Delete</button>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /// Managing the shelves themselves: add, rename, resize, delete.
 function ShelvesPanel({shelves, onChanged}){
   const [error,setError] = useState(null)
@@ -916,6 +1036,8 @@ export default function App(){
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
   const [placing,setPlacing]=useState(null)
+  // Bumped whenever a location changes, so the bookshelf browser refetches.
+  const [locationVersion,setLocationVersion]=useState(0)
 
   const sortNewestFirst = (list)=> Array.isArray(list) ? [...list].sort((a,b)=> (b.id||0)-(a.id||0)) : []
 
@@ -1006,13 +1128,13 @@ export default function App(){
     if(!undo) return
     try{
       if(undo.type==='delete'){
-        const res = await fetch(API_BASE + '/books', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
+        const res = await fetch(API_BASE + '/books', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
         if(res.ok){
           const restored = await res.json()
           if(undo.wasRecent) setRecent(prev=> sortNewestFirst([restored, ...prev]))
         }
       } else if(undo.type==='update'){
-        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags})})
+        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
         if(res.ok){
           const reverted = await res.json()
           setRecent(prev=> prev.map(x=> x.id===reverted.id ? reverted : x))
@@ -1026,6 +1148,8 @@ export default function App(){
     }catch(e){ console.error('Undo failed', e) }
     clearUndo()
     fetchBooks()
+    fetchShelves()
+    setLocationVersion(v=> v+1)
   }
 
   const handleDelete = async (book)=>{
@@ -1037,6 +1161,8 @@ export default function App(){
     setUndoWithTimeout({type:'delete', book, wasRecent})
     fetchBooks()
     fetchTags()
+    fetchShelves()
+    setLocationVersion(v=> v+1)
   }
 
   const onAdded = (created)=>{
@@ -1081,16 +1207,20 @@ export default function App(){
           {placing && (
             <ShelfPicker book={placing} shelves={shelves}
                          onClose={()=> setPlacing(null)}
-                         onSaved={(updated)=>{ onBookPatched(updated); fetchShelves() }} />
+                         onSaved={(updated)=>{ onBookPatched(updated); fetchShelves(); setLocationVersion(v=> v+1) }} />
           )}
           <div className="tabs">
             <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>
             <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves() }}>Manage</button>
-            <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Shelves</button>
+            <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>
           </div>
 
           {tab==='shelves' ? (
-            <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks() }} />
+            <>
+              <BookshelfBrowser shelves={shelves} refreshToken={locationVersion}
+                                onPlace={setPlacing} onDelete={handleDelete} />
+              <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks(); setLocationVersion(v=> v+1) }} />
+            </>
           ) : tab==='add' ? (
             <>
               <AddForm onAdded={onAdded} />

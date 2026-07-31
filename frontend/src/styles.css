@@ -120,6 +120,22 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
 .modal{background:#fff;border-radius:8px;padding:16px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 10px 40px rgba(0,0,0,.3)}
 .modal select{padding:7px 8px;border:1px solid #ccd0d5;border-radius:5px;font-size:14px;width:100%}
+.shelf-browse{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;margin-top:10px}
+.shelf-tabs{display:flex;gap:4px;flex-wrap:wrap}
+.shelf-tab{padding:4px 10px;font-size:13px;border-radius:999px}
+.shelf-tab.active{background:#2563eb;border-color:#2563eb;color:#fff}
+
+.slot-detail{flex:1 1 260px;min-width:0;border:1px solid #e3e6ea;border-radius:6px;padding:10px;background:#fafbfc;align-self:stretch}
+.slot-detail-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;
+  padding-bottom:6px;margin-bottom:6px;border-bottom:1px solid #e3e6ea;font-size:13px;color:#555}
+.slot-detail-empty{color:#888;font-size:13px;padding:6px 0}
+.slot-book{display:flex;gap:9px;align-items:flex-start;padding:7px 0;border-bottom:1px solid #eceef2}
+.slot-book:last-child{border-bottom:none}
+.slot-book button{padding:2px 8px;font-size:12px}
+.slot-book-title{font-size:13px;font-weight:600;overflow-wrap:anywhere}
+.slot-book-author{font-size:12px;color:#666;overflow-wrap:anywhere}
+.slot-book-tags{font-size:11px;color:#999;overflow-wrap:anywhere}
+
 /* Sharing a slot is normal — two thin books, or a shelf mid-reshuffle — so this
    states what is there rather than warning about it. */
 .notice{margin-top:8px;padding:7px 9px;border-radius:5px;background:#f5f6f8;border:1px solid #e3e6ea;color:#555;font-size:13px}
