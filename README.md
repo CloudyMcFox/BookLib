@@ -221,7 +221,11 @@ needs a redeploy. One 6×8 shelf is seeded on first start; change
 
 Books carry `shelf_id`, `shelf_column` and `shelf_row`, all nullable and all set
 together. The **Bookshelf** tab draws each shelf and lists what is in a slot when
-you click it, which is the quickest way to see what is where. In the Manage tab
+you click it, which is the quickest way to see what is where. Books can be
+**dragged onto a slot** to move them, and with more than one shelf, dragging over
+a shelf's name switches to it so a book can be moved between shelves in one
+gesture. Drag and drop is a mouse affordance — on a touch screen use the
+**Move** button, which opens the same picker. In the Manage tab
 the **Location** column opens a picker: click a slot on the shelf, or type the
 numbers. Slots already holding a book are shaded, and the picker lists what is
 there before you save.

@@ -453,7 +453,9 @@ function TagsCell({book, onChanged, onError}){
 // --- shelves ---
 
 /// A clickable shelf. Used for placing a book, and for showing where one lives.
-function ShelfGrid({shelf, slots, selected, onSelect, highlight, excludeBookId}){
+/// Pass onDropBook to accept books dragged onto a slot.
+function ShelfGrid({shelf, slots, selected, onSelect, highlight, excludeBookId, onDropBook, dragActive}){
+  const [hover,setHover] = useState(null)
   if(!shelf) return null
   const occupied = {}
   ;(slots||[]).forEach(s=>{
@@ -469,11 +471,26 @@ function ShelfGrid({shelf, slots, selected, onSelect, highlight, excludeBookId})
       const isSelected = selected && selected.column===c && selected.row===r
       const isHighlight = highlight && highlight.column===c && highlight.row===r
       const names = here.map(s=> s.title).join('\n')
+      const dropProps = onDropBook ? {
+        // preventDefault on dragover is what actually marks a element as a
+        // valid drop target; without it the browser refuses the drop.
+        onDragOver: (e)=>{ e.preventDefault(); e.dataTransfer.dropEffect = 'move' },
+        onDragEnter: ()=> setHover(key),
+        onDragLeave: ()=> setHover(h=> h===key ? null : h),
+        onDrop: (e)=>{
+          e.preventDefault()
+          setHover(null)
+          const id = Number(e.dataTransfer.getData('text/plain'))
+          if(id) onDropBook(id, c, r)
+        }
+      } : {}
       cells.push(
-        <button key={key} type="button"
-                className={['shelf-slot', here.length? 'occupied':'', isSelected? 'selected':'', isHighlight? 'highlight':''].filter(Boolean).join(' ')}
+        <button key={key} type="button" {...dropProps}
+                className={['shelf-slot', here.length? 'occupied':'', isSelected? 'selected':'',
+                            isHighlight? 'highlight':'', dragActive? 'droppable':'',
+                            hover===key? 'drop-hover':''].filter(Boolean).join(' ')}
                 onClick={onSelect? ()=>onSelect(c, r) : undefined}
-                disabled={!onSelect}
+                disabled={!onSelect && !onDropBook}
                 title={here.length? `Column ${c}, row ${r}\n${names}` : `Column ${c}, row ${r} — empty`}>
           <span className="shelf-slot-coord">{c},{r}</span>
           {here.length>0 && <span className="shelf-slot-books">{here.length>1? here.length+' books' : here[0].title}</span>}
@@ -599,12 +616,13 @@ function CoverThumb({book, width=34}){
 }
 
 /// Browse a shelf: see it drawn, click a slot to see what is in it.
-function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete}){
+function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
   const [shelfId,setShelfId] = useState(shelves[0] ? shelves[0].id : null)
   const [books,setBooks] = useState([])
   const [selected,setSelected] = useState(null)
   const [loading,setLoading] = useState(false)
   const [error,setError] = useState(null)
+  const [dragging,setDragging] = useState(null)
 
   // Keep a valid shelf selected as shelves come and go.
   useEffect(()=>{
@@ -641,6 +659,30 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete}){
     ? books.filter(b=> b.shelf_column===selected.column && b.shelf_row===selected.row)
     : []
 
+  /// Drop handler: move a book to a slot on the shelf being viewed. Works
+  /// across shelves too, since hovering a shelf tab mid-drag switches to it.
+  const moveBook = async (bookId, column, row)=>{
+    const book = books.find(b=> b.id===bookId)
+    setDragging(null)
+    // A book dragged from another shelf will not be in this list; only skip
+    // when we can see it is already exactly here.
+    if(book && book.shelf_id===shelfId && book.shelf_column===column && book.shelf_row===row) return
+    setError(null)
+    try{
+      const res = await fetch(`${API_BASE}/books/${bookId}/location`, {
+        method:'PUT', headers: authHeaders(true),
+        body: JSON.stringify({shelf_id: shelfId, shelf_column: column, shelf_row: row})})
+      if(!res.ok){ setError(await readError(res)); return }
+      const updated = await res.json()
+      setBooks(prev=> prev.some(b=> b.id===updated.id)
+        ? prev.map(b=> b.id===updated.id ? updated : b)
+        : [...prev, updated])
+      // Follow the book, so it is obvious where it landed.
+      setSelected({column, row})
+      if(onMoved) onMoved(updated)
+    }catch(err){ setError(friendlyMessage(err.message)) }
+  }
+
   if(!shelves.length){
     return <div className="card"><h3>Bookshelf</h3>
       <div style={{color:'#666'}}>No shelves yet — add one below to get started.</div></div>
@@ -655,7 +697,13 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete}){
             {shelves.map(s=> (
               <button key={s.id} type="button"
                       className={s.id===shelfId ? 'shelf-tab active' : 'shelf-tab'}
-                      onClick={()=>{ setShelfId(s.id); setSelected(null) }}>
+                      onClick={()=>{ setShelfId(s.id); setSelected(null) }}
+                      // Hovering a shelf while dragging switches to it, which is
+                      // what makes moving a book between shelves possible.
+                      onDragOver={e=>{
+                        e.preventDefault()
+                        if(dragging && s.id!==shelfId){ setShelfId(s.id); setSelected(null) }
+                      }}>
                 {s.name}
               </button>
             ))}
@@ -672,7 +720,9 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete}){
         <div className="shelf-frame" style={{flex:'1 1 320px'}}>
           <ShelfGrid shelf={shelf} slots={slots}
                      selected={selected}
-                     onSelect={(c,r)=> setSelected({column:c, row:r})} />
+                     onSelect={(c,r)=> setSelected({column:c, row:r})}
+                     onDropBook={moveBook}
+                     dragActive={!!dragging} />
         </div>
 
         <div className="slot-detail">
@@ -684,9 +734,23 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete}){
                 <strong>Column {selected.column}, row {selected.row}</strong>
                 <span>{inSlot.length? `${inSlot.length} book${inSlot.length===1?'':'s'}` : 'Empty'}</span>
               </div>
+              {inSlot.length>0 && (
+                <div className="drag-hint">
+                  Drag a book onto a slot to move it{shelves.length>1 ? ', or onto a shelf name to move it there' : ''}.
+                </div>
+              )}
               {inSlot.length===0 && <div className="slot-detail-empty">Nothing here yet.</div>}
               {inSlot.map(b=> (
-                <div key={b.id} className="slot-book">
+                <div key={b.id}
+                     className={dragging===b.id ? 'slot-book dragging' : 'slot-book'}
+                     draggable
+                     onDragStart={e=>{
+                       e.dataTransfer.setData('text/plain', String(b.id))
+                       e.dataTransfer.effectAllowed = 'move'
+                       setDragging(b.id)
+                     }}
+                     onDragEnd={()=> setDragging(null)}>
+                  <span className="drag-handle" title="Drag onto a slot to move this book">⠿</span>
                   <CoverThumb book={b} width={34} />
                   <div style={{minWidth:0,flex:1}}>
                     <div className="slot-book-title">{b.title}</div>
@@ -1218,7 +1282,8 @@ export default function App(){
           {tab==='shelves' ? (
             <>
               <BookshelfBrowser shelves={shelves} refreshToken={locationVersion}
-                                onPlace={setPlacing} onDelete={handleDelete} />
+                                onPlace={setPlacing} onDelete={handleDelete}
+                                onMoved={(updated)=>{ onBookPatched(updated); fetchShelves() }} />
               <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks(); setLocationVersion(v=> v+1) }} />
             </>
           ) : tab==='add' ? (

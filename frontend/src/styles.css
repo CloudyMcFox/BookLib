@@ -107,6 +107,15 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .shelf-slot.occupied{background:#dbe6f5;border-color:#8fa8c8}
 .shelf-slot.selected{background:#2563eb;border-color:#1d4ed8;color:#fff;box-shadow:0 0 0 2px rgba(37,99,235,.35)}
 .shelf-slot.highlight{background:#fde68a;border-color:#d97706;box-shadow:0 0 0 2px rgba(217,119,6,.45)}
+/* Drag and drop: every slot shows it will accept a book, the one under the
+   pointer more strongly. */
+.shelf-slot.droppable{border-style:dashed;border-color:#2563eb}
+.shelf-slot.drop-hover{background:#2563eb;border-style:solid;border-color:#1d4ed8;color:#fff;transform:scale(1.04)}
+.shelf-slot.drop-hover .shelf-slot-coord{opacity:.9}
+/* Children must not take pointer events: moving over one fires dragleave on the
+   slot itself, which makes the drop highlight flicker. Clicks still land,
+   because they pass through to the button. */
+.shelf-slot > *{pointer-events:none}
 .shelf-slot-coord{font-family:ui-monospace,Consolas,monospace;font-size:9px;opacity:.6}
 .shelf-slot.selected .shelf-slot-coord{opacity:.85}
 .shelf-slot-books{font-weight:600;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
@@ -132,6 +141,10 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .slot-book{display:flex;gap:9px;align-items:flex-start;padding:7px 0;border-bottom:1px solid #eceef2}
 .slot-book:last-child{border-bottom:none}
 .slot-book button{padding:2px 8px;font-size:12px}
+.slot-book.dragging{opacity:.4}
+.drag-handle{cursor:grab;color:#bbb;font-size:15px;line-height:1.4;user-select:none;flex:0 0 auto}
+.slot-book:active .drag-handle{cursor:grabbing}
+.drag-hint{font-size:11px;color:#999;padding-bottom:4px}
 .slot-book-title{font-size:13px;font-weight:600;overflow-wrap:anywhere}
 .slot-book-author{font-size:12px;color:#666;overflow-wrap:anywhere}
 .slot-book-tags{font-size:11px;color:#999;overflow-wrap:anywhere}
