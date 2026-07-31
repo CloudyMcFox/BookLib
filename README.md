@@ -226,8 +226,9 @@ the picker names what is there before you save.
 
 A few behaviours worth knowing:
 
-- **Two books may share a slot.** It happens mid-reshuffle, and refusing would be
-  more annoying than helpful. The picker warns instead of blocking.
+- **Two books may share a slot.** Thin books pair up and shelves get reshuffled,
+  so this is an ordinary situation rather than an error. The picker lists what is
+  already in the slot for information; nothing blocks the save.
 - **Shrinking a shelf is refused** while books sit in the slots that would be cut
   off, and says how many. Losing a position silently is worse than being made to
   move the books first.

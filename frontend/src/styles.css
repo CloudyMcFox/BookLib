@@ -120,7 +120,9 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}
 .modal{background:#fff;border-radius:8px;padding:16px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:0 10px 40px rgba(0,0,0,.3)}
 .modal select{padding:7px 8px;border:1px solid #ccd0d5;border-radius:5px;font-size:14px;width:100%}
-.notice{margin-top:8px;padding:7px 9px;border-radius:5px;background:#fff7ed;border:1px solid #fed7aa;color:#7c2d12;font-size:13px}
+/* Sharing a slot is normal — two thin books, or a shelf mid-reshuffle — so this
+   states what is there rather than warning about it. */
+.notice{margin-top:8px;padding:7px 9px;border-radius:5px;background:#f5f6f8;border:1px solid #e3e6ea;color:#555;font-size:13px}
 
 .snackbar{position:fixed;right:20px;bottom:20px;background:#222;color:#fff;padding:12px 14px;border-radius:6px;display:flex;gap:10px;align-items:center;z-index:50;font-size:14px}.snackbar button{background:transparent;border:1px solid #666;color:#fff}
 .snackbar button:hover{background:#333}

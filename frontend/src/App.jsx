@@ -570,7 +570,9 @@ function ShelfPicker({book, shelves, onClose, onSaved}){
             </div>
 
             {clash.length>0 && (
-              <div className="notice">Also in this slot: {clash.map(s=> s.title).join(', ')}</div>
+              <div className="notice">
+                Also in this slot: {clash.map(s=> s.title).join(', ')}
+              </div>
             )}
           </>
         )}
