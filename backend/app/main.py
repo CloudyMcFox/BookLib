@@ -831,6 +831,30 @@ def _google_sibling_volumes(title: str, author: Optional[str]) -> List[dict]:
     return matched
 
 
+def _resolve_google_id(isbn: Optional[str], title: Optional[str],
+                       author: Optional[str]) -> Optional[str]:
+    """The Google Books volume id for a book, by ISBN and then by title/author.
+
+    Google's `isbn:` index misses often enough -- a regional edition, a reissue
+    under a different number -- that the ISBN search alone leaves plenty of
+    books without an id even though Google plainly has them. Both the ISBN
+    lookup and the per-book lookup use this so a scan resolves the same id the
+    Look up button would."""
+    volume_id = (_google_volume_item(isbn) or {}).get('id')
+    if volume_id:
+        return volume_id
+
+    wanted_title = clean(title)
+    if not wanted_title:
+        return None
+    # Search on the first author only: "Gaiman, Pratchett" matches nothing.
+    wanted_author = clean(author) or ''
+    if ',' in wanted_author:
+        wanted_author = wanted_author.split(',')[0].strip()
+    siblings = _google_sibling_volumes(wanted_title, wanted_author or None)
+    return siblings[0].get('id') if siblings else None
+
+
 # Per-volume detail costs a request each, so only probe the first few siblings.
 MAX_SIBLING_DETAIL_FETCHES = 5
 
@@ -1302,13 +1326,7 @@ def lookup_book_google_id(book_id: int, current_user: dict = Depends(get_current
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
 
-    volume_id = (_google_volume_item(row['isbn']) or {}).get('id')
-    if not volume_id and clean(row['title']):
-        author = clean(row['author']) or ''
-        if ',' in author:
-            author = author.split(',')[0].strip()
-        siblings = _google_sibling_volumes(row['title'], author or None)
-        volume_id = siblings[0].get('id') if siblings else None
+    volume_id = _resolve_google_id(row['isbn'], row['title'], row['author'])
     if not volume_id:
         raise HTTPException(status_code=404, detail="No Google Books volume found for this book")
 
@@ -1794,14 +1812,16 @@ def lookup_isbn(isbn: str, current_user: dict = Depends(get_current_user)):
         item = None
 
     if item:
+        authors = [a.get("name") for a in item.get("authors", [])]
         return {
             "title": item.get("title"),
-            "authors": [a.get("name") for a in item.get("authors", [])],
+            "authors": authors,
             "publish_date": item.get("publish_date"),
             "olid": clean_olid(item.get("key")) or _lookup_olid_by_isbn(isbn),
             # Worth resolving even when OpenLibrary answered: storing it makes
             # later tag and cover lookups a single request.
-            "google_id": (_google_volume_item(isbn) or {}).get("id"),
+            "google_id": _resolve_google_id(isbn, item.get("title"),
+                                            authors[0] if authors else None),
             "source": "openlibrary",
         }
 
