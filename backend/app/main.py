@@ -73,6 +73,57 @@ def clean_olid(value: Optional[str]) -> Optional[str]:
     return m.group(0) if m else None
 
 
+# The bindings worth having a single spelling for. Anything else a user types is
+# kept as typed -- this is a tidying pass, not a whitelist.
+KNOWN_FORMATS = [
+    "Hardcover",
+    "Leatherbound",
+    "Paperback",
+    "Mass market paperback",
+    "Board book",
+    "Spiral-bound",
+    "Library binding",
+    "Ebook",
+    "Audiobook",
+]
+
+# Matched in order, so the specific wins: "mass market paperback" must be tested
+# before "paperback", and "library binding" before the cloth-and-boards
+# spellings of hardcover.
+_FORMAT_PATTERNS = [
+    ("Library binding", (r'library\s*bind',)),
+    ("Mass market paperback", (r'mass\s*market', r'\bmmpb\b', r'\bmm\s*pb\b')),
+    ("Board book", (r'board\s*book',)),
+    ("Spiral-bound", (r'spiral', r'comb\s*bound', r'wire[-\s]*o\b')),
+    ("Leatherbound", (r'leather',)),
+    ("Audiobook", (r'audio', r'\bcd\b', r'\bmp3\b', r'cassette', r'spoken')),
+    ("Ebook", (r'e-?book', r'electronic', r'\bepub\b', r'kindle', r'digital', r'\bpdf\b')),
+    ("Paperback", (r'paperback', r'\bpbk', r'soft\s*cover', r'softback', r'\btrade\s*pb\b', r'\bpaper\b')),
+    ("Hardcover", (r'hard\s*cover', r'hardback', r'\bhbk', r'\bhc\b', r'\bcloth\b', r'\bboards?\b',
+                   r'\bbound\b')),
+]
+
+
+def clean_format(value: Optional[str]) -> Optional[str]:
+    """Normalise a binding.
+
+    OpenLibrary records the same binding half a dozen ways -- 'pbk.',
+    'Paperback', 'paperback', 'Trade paperback' -- and a field that spells one
+    thing several ways cannot be filtered or scanned down a column. Known
+    shapes are bucketed into one spelling each; anything unrecognised is kept
+    as it was written, since a user typing 'Slipcased' means it."""
+    v = clean(value)
+    if not v:
+        return None
+    lowered = v.lower()
+    for canonical, patterns in _FORMAT_PATTERNS:
+        if any(re.search(pattern, lowered) for pattern in patterns):
+            return canonical
+    # Unknown, so keep it -- trimmed, and capped so a stray paragraph cannot be
+    # parked in the column.
+    return v[:60]
+
+
 def clean_google_id(value: Optional[str]) -> Optional[str]:
     """Normalise a Google Books volume id.
 
@@ -123,6 +174,9 @@ class Book(BaseModel):
     # Google Books volume id (e.g. otCEEQAAQBAJ). Lets a lookup go straight to
     # the volume record instead of searching for it first.
     google_id: Optional[str] = None
+    # Binding: Hardcover, Paperback and so on. Free text, but written through
+    # clean_format so the same binding is not spelled three ways.
+    format: Optional[str] = None
     notes: Optional[str] = None
     # Physical location. All three travel together: a shelf without a slot, or a
     # slot without a shelf, is not a position.
@@ -251,6 +305,11 @@ if 'shelf_column' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN shelf_column INTEGER")
 if 'shelf_row' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN shelf_row INTEGER")
+# Binding: hardcover, paperback and so on. Free text, but written through
+# clean_format so the handful of shapes OpenLibrary uses for the same thing end
+# up as one value.
+if 'format' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN format TEXT")
 conn.execute("CREATE INDEX IF NOT EXISTS idx_books_shelf ON books(shelf_id)")
 
 # Seed one shelf so the feature works out of the box rather than presenting an
@@ -262,7 +321,7 @@ if not conn.execute("SELECT 1 FROM shelves LIMIT 1").fetchone():
 conn.commit()
 
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
-BOOK_COLUMNS = "id, title, author, isbn, olid, google_id, notes, created_at, shelf_id, shelf_column, shelf_row, length(cover) AS cover_size"
+BOOK_COLUMNS = "id, title, author, isbn, olid, google_id, notes, format, created_at, shelf_id, shelf_column, shelf_row, length(cover) AS cover_size"
 
 # Whitelisted ORDER BY clauses, so the sort parameter can never be injected.
 # Books added before created_at existed sort by id, which preserves insert order.
@@ -905,6 +964,41 @@ def _lookup_olid_by_isbn(isbn: Optional[str]) -> Optional[str]:
     return None
 
 
+def _openlibrary_format(olid: Optional[str], isbn: Optional[str]) -> Optional[str]:
+    """The binding OpenLibrary records for an edition.
+
+    Google Books is no help here: its only related field is printType, which is
+    BOOK or MAGAZINE and says nothing about how the thing is bound. So this is
+    OpenLibrary or nothing, by edition id, falling back to resolving the ISBN to
+    one.
+
+    Note that the binding belongs to the *edition*, not the work: a book with no
+    OLID and no ISBN cannot be answered for, since there is no way to say which
+    printing is on the shelf."""
+    edition = clean_olid(olid) or _lookup_olid_by_isbn(isbn)
+    if edition:
+        try:
+            r = requests.get(f"{OL_BASE}/books/{edition}.json", timeout=8)
+            if r.status_code == 200:
+                found = clean_format(r.json().get('physical_format'))
+                if found:
+                    return found
+        except (requests.RequestException, ValueError):
+            pass
+
+    cleaned = re.sub(r'[^0-9Xx]', '', isbn or '')
+    if not cleaned:
+        return None
+    try:
+        r = requests.get(f"{OL_BASE}/api/books?bibkeys=ISBN:{cleaned}&format=json&jscmd=details", timeout=8)
+        if r.status_code == 200:
+            details = (r.json().get(f"ISBN:{cleaned}") or {}).get('details') or {}
+            return clean_format(details.get('physical_format'))
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
 def _fetch_genres(olid: Optional[str], isbn: Optional[str],
                   title: Optional[str] = None, author: Optional[str] = None,
                   google_id: Optional[str] = None) -> List[str]:
@@ -1198,6 +1292,11 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(get_current_
         conn.execute("UPDATE books SET title=?, author=?, isbn=?, olid=?, google_id=?, notes=? WHERE id=?",
                      (title, clean(b.author), clean(b.isbn), clean_olid(b.olid), clean_google_id(b.google_id),
                       clean(b.notes), book_id))
+        # Only when the caller actually sent it, for the same reason as the
+        # location: a client written before this field existed omits it, and
+        # editing a title from an older app should not quietly erase the format.
+        if 'format' in sent:
+            conn.execute("UPDATE books SET format=? WHERE id=?", (clean_format(b.format), book_id))
         if location_sent:
             location = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
             conn.execute("UPDATE books SET shelf_id=?, shelf_column=?, shelf_row=? WHERE id=?",
@@ -1225,12 +1324,16 @@ def add_book(b: Book, current_user: dict = Depends(get_current_user)):
     b.title, b.author, b.isbn, b.notes = title, clean(b.author), clean(b.isbn), clean(b.notes)
     b.olid = clean_olid(b.olid)
     b.google_id = clean_google_id(b.google_id)
+    # The client knows the binding when the book was added from a chosen
+    # edition; ask OpenLibrary only when it does not, which is the manual and
+    # scanned paths.
+    b.format = clean_format(b.format) or _openlibrary_format(b.olid, b.isbn)
     # Allow an explicit added date (e.g. when restoring a deleted book via undo).
     b.created_at = clean_timestamp(b.created_at) or now_iso()
     b.shelf_id, b.shelf_column, b.shelf_row = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
     try:
-        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, created_at, shelf_id, shelf_column, shelf_row) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                           (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.created_at,
+        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, format, created_at, shelf_id, shelf_column, shelf_row) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                           (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.format, b.created_at,
                             b.shelf_id, b.shelf_column, b.shelf_row))
         conn.commit()
         b.id = cur.lastrowid
@@ -1314,6 +1417,41 @@ def lookup_book_olid(book_id: int, current_user: dict = Depends(get_current_user
     conn.commit()
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone())
+
+@app.post("/books/{book_id}/format/lookup", response_model=Book)
+def lookup_book_format(book_id: int, current_user: dict = Depends(get_current_user)):
+    """Fetch the binding for one book from OpenLibrary.
+
+    Per book rather than across the library: unlike a cover, a wrong answer here
+    is a plausible-looking word in a column, and a sweep over every book would
+    bury the ones it got wrong among the ones it got right."""
+    cur = conn.execute("SELECT id, isbn, olid FROM books WHERE id=?", (book_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not clean(row['isbn']) and not clean_olid(row['olid']):
+        raise HTTPException(status_code=400,
+                            detail="This book needs an ISBN or an OLID before its format can be looked up")
+
+    found = _openlibrary_format(row['olid'], row['isbn'])
+    if not found:
+        raise HTTPException(status_code=404, detail="OpenLibrary does not record a format for this edition")
+
+    conn.execute("UPDATE books SET format=? WHERE id=?", (found, book_id))
+    conn.commit()
+    cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
+    return book_from_row(cur.fetchone())
+
+@app.get("/formats")
+def list_formats(current_user: dict = Depends(get_current_user)):
+    """The bindings offered in the pickers, and whatever else is already in use.
+
+    Clients suggest rather than restrict, so a value typed by hand on one of
+    them shows up in the list on the others instead of looking like a mistake."""
+    in_use = [r['format'] for r in conn.execute(
+        "SELECT DISTINCT format FROM books WHERE format IS NOT NULL AND format<>'' ORDER BY format COLLATE NOCASE")]
+    extra = [f for f in in_use if f not in KNOWN_FORMATS]
+    return {"known": KNOWN_FORMATS, "in_use": in_use, "other": extra}
 
 @app.post("/books/{book_id}/google/lookup", response_model=Book)
 def lookup_book_google_id(book_id: int, current_user: dict = Depends(get_current_user)):

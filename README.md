@@ -11,6 +11,8 @@ anywhere Docker does — it was built to live on a Synology NAS.
 - Sort the library by title, author, date added or shelf location.
 - Record where each book physically lives, on shelves you define yourself.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
+- Format: the binding — Hardcover, Paperback and so on — taken from OpenLibrary
+  per book, editable by hand.
 - Cover images are downloaded from OpenLibrary and stored in the database, with
   a manual lookup/upload button for books that are missing one.
 - Bulk import from CSV.
@@ -145,7 +147,9 @@ All routes except `/health` and `/token` require an
 | `POST`   | `/books/{id}/olid/lookup` | Resolve the OLID from the ISBN |
 | `POST`   | `/books/{id}/google/lookup` | Resolve the Google Books volume id |
 | `POST`   | `/books/{id}/tags/lookup` | Add genre tags, `?replace=true` to swap |
+| `POST`   | `/books/{id}/format/lookup` | Fetch the binding from OpenLibrary |
 | `GET`    | `/tags`           | Tags in use, with book counts            |
+| `GET`    | `/formats`        | Known bindings, and any others in use    |
 | `GET`    | `/shelves`        | Shelves with their sizes and book counts |
 | `POST`   | `/shelves`        | Add a shelf                              |
 | `PUT`    | `/shelves/{id}`   | Rename or resize a shelf                 |
@@ -258,6 +262,7 @@ Google Books is consulted as a fallback in four places:
 | Tags | OpenLibrary edition subjects + parent work subjects, **merged with** Google `categories` |
 | Covers | explicit URL → OpenLibrary by OLID → by ISBN → Google `imageLinks` |
 | ISBN lookup | OpenLibrary → Google volume metadata |
+| Format | OpenLibrary only — Google's `printType` is `BOOK`/`MAGAZINE` and says nothing about binding |
 | Title/author search | OpenLibrary results, **merged with** Google hits it did not already return |
 
 A stored `google_id` short-circuits the Google half of all of these: the volume

@@ -76,6 +76,8 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .tag-count{opacity:.65;font-size:11px}
 .tag-list{display:flex;flex-wrap:wrap;gap:4px}
 .tags-cell{display:flex;flex-direction:column;gap:6px;min-width:150px;max-width:240px}
+.format-cell{display:flex;flex-direction:column;gap:6px}
+.format-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}
 .tags-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}
 
 .tag-filter{margin-top:10px;padding:8px;border:1px solid #e3e6ea;border-radius:6px;background:#fafbfc}

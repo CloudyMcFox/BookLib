@@ -176,7 +176,7 @@ function AddForm({onAdded}){
     setSearching(false)
   }
 
-  const handleAddFromSearch = async (doc, isbnVal, olidVal, coverVal, googleVal) =>{
+  const handleAddFromSearch = async (doc, isbnVal, olidVal, coverVal, googleVal, formatVal) =>{
     let details = null
     try{
       if(olidVal){
@@ -194,7 +194,9 @@ function AddForm({onAdded}){
     const display = `${titleVal}${authorsVal? ' — ' + authorsVal: ''}${pub? ' ('+pub+')':''}`
     if(!confirm('Add this edition to your library?\n\n' + display)) return
 
-    const payload = { title: titleVal, author: authorsVal, isbn: t(isbnVal || (details && details.isbns && details.isbns[0])), olid: olidVal || null, google_id: googleVal || (details && details.google_id) || null, notes: '', cover_url: coverVal || null }
+    const payload = { title: titleVal, author: authorsVal, isbn: t(isbnVal || (details && details.isbns && details.isbns[0])), olid: olidVal || null, google_id: googleVal || (details && details.google_id) || null, notes: '', cover_url: coverVal || null,
+                      // The chosen edition already says how it is bound; no reason to make the server go and ask.
+                      format: formatVal || (details && details.format) || null }
     try{
       const r = await fetch(API_BASE + '/books', {method: 'POST', headers: authHeaders(true), body: JSON.stringify(payload)})
       if(!r.ok){ setError(await readError(r)); return }
@@ -256,7 +258,7 @@ function AddForm({onAdded}){
                         const wanted = t(isbn).replace(/[-\s]/g,'')
                         const match = wanted && (ed.isbns||[]).some(x=> String(x).replace(/[-\s]/g,'')===wanted)
                         return (
-                          <button key={ed.olid || ed.isbns?.[0] || ii} type="button" className={match? 'edition-card match':'edition-card'} onClick={()=>handleAddFromSearch(doc, (ed.isbns && ed.isbns[0]) || null, ed.olid, ed.cover, ed.google_id)}>
+                          <button key={ed.olid || ed.isbns?.[0] || ii} type="button" className={match? 'edition-card match':'edition-card'} onClick={()=>handleAddFromSearch(doc, (ed.isbns && ed.isbns[0]) || null, ed.olid, ed.cover, ed.google_id, ed.format)}>
                             {ed.cover
                               ? <img src={ed.cover} alt="cover" className="edition-cover"/>
                               : <div className="edition-cover edition-cover-empty">No cover</div>}
@@ -445,6 +447,38 @@ function TagsCell({book, onChanged, onError}){
       <button type="button" onClick={lookup} disabled={busy}
               title="Fetch genres from OpenLibrary or Google Books">
         {busy ? '...' : (tags.length ? 'Refresh tags' : 'Lookup tags')}
+      </button>
+    </div>
+  )
+}
+
+// --- format ---
+
+// Offered in the picker. The field is free text underneath: these are the
+// spellings worth agreeing on, not the only allowed answers.
+const KNOWN_FORMATS = ['Hardcover', 'Leatherbound', 'Paperback', 'Mass market paperback',
+                       'Board book', 'Spiral-bound', 'Library binding', 'Ebook', 'Audiobook']
+
+function FormatCell({book, onChanged, onError}){
+  const [busy,setBusy]=useState(false)
+
+  const lookup = async ()=>{
+    if(book.format && !confirm(`Re-fetch the format from OpenLibrary for "${book.title}"?\n\nIt is currently ${book.format}.`)) return
+    setBusy(true); onError(null)
+    try{
+      const res = await fetch(`${API_BASE}/books/${book.id}/format/lookup`, {method:'POST', headers: authHeaders()})
+      if(!res.ok){ onError(await readError(res)) }
+      else if(onChanged) onChanged(await res.json())
+    }catch(err){ onError(friendlyMessage(err.message)) }
+    setBusy(false)
+  }
+
+  return (
+    <div className="format-cell">
+      {book.format ? <span>{book.format}</span> : <span className="muted">No format</span>}
+      <button type="button" onClick={lookup} disabled={busy}
+              title="Fetch the binding from OpenLibrary. Google Books does not record it.">
+        {busy ? '...' : (book.format ? 'Refresh' : 'Lookup')}
       </button>
     </div>
   )
@@ -984,22 +1018,23 @@ function SortHeader({label, field, sort, onSort}){
 
 function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace}){
   const [editingId, setEditingId] = useState(null)
-  const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', added:'', addedOriginal:''})
+  const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', added:'', addedOriginal:''})
   const [rowError, setRowError] = useState(null)
 
   const startEdit = (b)=>{
     setRowError(null)
     setEditingId(b.id)
     const added = toDateInput(b.created_at)
-    setEditVals({title: b.title||'', author: b.author||'', isbn: b.isbn||'', olid: b.olid||'', googleId: b.google_id||'', notes: b.notes||'', tags: (b.tags||[]).join(', '), added, addedOriginal: added})
+    setEditVals({title: b.title||'', author: b.author||'', isbn: b.isbn||'', olid: b.olid||'', googleId: b.google_id||'', notes: b.notes||'', tags: (b.tags||[]).join(', '), format: b.format||'', added, addedOriginal: added})
   }
-  const cancelEdit = ()=>{ setEditingId(null); setRowError(null); setEditVals({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', added:'', addedOriginal:''}) }
+  const cancelEdit = ()=>{ setEditingId(null); setRowError(null); setEditVals({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', added:'', addedOriginal:''}) }
 
   const saveEdit = async (book)=>{
     setRowError(null)
     const vals = {title: t(editVals.title), author: t(editVals.author), isbn: t(editVals.isbn), olid: t(editVals.olid),
                   google_id: t(editVals.googleId), notes: t(editVals.notes),
-                  tags: editVals.tags.split(',').map(t).filter(Boolean)}
+                  tags: editVals.tags.split(',').map(t).filter(Boolean),
+                  format: t(editVals.format)}
     if(!vals.title){ setRowError('Title is required'); return }
     if(vals.isbn && !validateISBN(vals.isbn)){ setRowError('ISBN must be 10 or 13 digits'); return }
     if(vals.olid && !/^OL\d+M$/i.test(vals.olid)){ setRowError('OLID must look like OL12345M'); return }
@@ -1035,6 +1070,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
           <th>Sources</th>
           <SortHeader label="Location" field="location" sort={sort} onSort={onSort} />
           <th>Tags</th>
+          <th>Format</th>
           <th className="col-notes">Notes</th>
           <SortHeader label="Added" field="added" sort={sort} onSort={onSort} />
           <th></th>
@@ -1054,6 +1090,13 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   </td>
                   <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
                   <td><input value={editVals.tags} placeholder="comma, separated, tags" onChange={e=>setEditVals({...editVals, tags: e.target.value})} /></td>
+                  <td>
+                    <input list="known-formats" value={editVals.format} placeholder="Paperback"
+                           onChange={e=>setEditVals({...editVals, format: e.target.value})} />
+                    <datalist id="known-formats">
+                      {KNOWN_FORMATS.map(f=> <option key={f} value={f} />)}
+                    </datalist>
+                  </td>
                   <td className="col-notes"><input value={editVals.notes} onChange={e=>setEditVals({...editVals, notes: e.target.value})} /></td>
                   <td><input type="date" value={editVals.added} onChange={e=>setEditVals({...editVals, added: e.target.value})} /></td>
                   <td className="nowrap">
@@ -1069,6 +1112,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   <td><SourcesCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
                   <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
                   <td><TagsCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
+                  <td className="nowrap"><FormatCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
                   <td className="col-notes">{b.notes}</td>
                   <td className="nowrap">{formatAdded(b.created_at)}</td>
                   <td className="nowrap">
