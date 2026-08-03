@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { Fragment, useState, useEffect, useRef } from 'react'
 
 // Backend URL. Set VITE_API_BASE at build time (see .env / docker-compose.yml).
 // Falls back to the current origin, which works when a reverse proxy serves
@@ -14,6 +14,29 @@ function validateISBN(isbn){
 
 // inputs are trimmed at point of use so stray whitespace never reaches the API
 const t = (s)=> (s==null ? '' : String(s).trim())
+
+// Ids arrive however they were copied: bare, or as the address bar of the page
+// they were read off. The backend already accepts both, so a form that rejects
+// what the API would have taken is the form being wrong.
+function normalizeOlid(value){
+  const m = t(value).toUpperCase().match(/OL\d+M/)
+  return m ? m[0] : null
+}
+
+function olidProblem(value){
+  return /OL\d+W/i.test(t(value))
+    ? 'That is a work id. Use the edition id from the book\'s own OpenLibrary page — it ends in M, like OL12345M.'
+    : 'OLID must look like OL12345M'
+}
+
+function normalizeGoogleId(value){
+  const v = t(value)
+  if(!v) return null
+  const query = v.match(/[?&]id=([A-Za-z0-9_-]+)/)
+  if(query) return query[1]
+  const bare = v.includes('/') ? (v.split('?')[0].split('/').filter(Boolean).pop() || v) : v
+  return /^[A-Za-z0-9_-]{8,40}$/.test(bare) ? bare : null
+}
 
 function formatAdded(value){
   if(!value) return '—'
@@ -112,7 +135,11 @@ function AddForm({onAdded}){
     if(!vals.isbn) missing.push('ISBN')
     if(missing.length){ setError(`${missing.join(', ')} ${missing.length>1?'are':'is'} required to add a book manually`); return }
     if(!validateISBN(vals.isbn)){ setError('ISBN must be 10 or 13 digits'); return }
-    if(vals.olid && !/^OL\d+M$/i.test(vals.olid)){ setError('OLID must look like OL12345M'); return }
+    if(vals.olid){
+      const olid = normalizeOlid(vals.olid)
+      if(!olid){ setError(olidProblem(vals.olid)); return }
+      vals.olid = olid
+    }
     try{
       const res = await fetch(API_BASE + '/books',{method:'POST', headers: authHeaders(true), body: JSON.stringify(vals)})
       if(!res.ok){ setError(await readError(res)); return }
@@ -1019,7 +1046,11 @@ function SortHeader({label, field, sort, onSort}){
 function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace}){
   const [editingId, setEditingId] = useState(null)
   const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', added:'', addedOriginal:''})
+  // Which row the message belongs to, not just the message: an error printed
+  // above a long table is off screen for the row that caused it, which reads as
+  // the button having done nothing at all.
   const [rowError, setRowError] = useState(null)
+  const showRowError = (bookId, message)=> setRowError(message ? {bookId, message} : null)
 
   const startEdit = (b)=>{
     setRowError(null)
@@ -1035,23 +1066,31 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   google_id: t(editVals.googleId), notes: t(editVals.notes),
                   tags: editVals.tags.split(',').map(t).filter(Boolean),
                   format: t(editVals.format)}
-    if(!vals.title){ setRowError('Title is required'); return }
-    if(vals.isbn && !validateISBN(vals.isbn)){ setRowError('ISBN must be 10 or 13 digits'); return }
-    if(vals.olid && !/^OL\d+M$/i.test(vals.olid)){ setRowError('OLID must look like OL12345M'); return }
-    if(vals.google_id && !/^[A-Za-z0-9_-]{8,40}$/.test(vals.google_id)){ setRowError('Google ID must look like otCEEQAAQBAJ'); return }
+    if(!vals.title){ showRowError(book.id, 'Title is required'); return }
+    if(vals.isbn && !validateISBN(vals.isbn)){ showRowError(book.id, 'ISBN must be 10 or 13 digits'); return }
+    if(vals.olid){
+      const olid = normalizeOlid(vals.olid)
+      if(!olid){ showRowError(book.id, olidProblem(vals.olid)); return }
+      vals.olid = olid
+    }
+    if(vals.google_id){
+      const googleId = normalizeGoogleId(vals.google_id)
+      if(!googleId){ showRowError(book.id, 'Google ID must look like otCEEQAAQBAJ'); return }
+      vals.google_id = googleId
+    }
     // Only send the added date when it was actually changed, so an untouched row
     // keeps the time-of-day part of its original timestamp.
     if(editVals.added !== editVals.addedOriginal){
-      if(!editVals.added){ setRowError('Date added cannot be cleared'); return }
+      if(!editVals.added){ showRowError(book.id, 'Date added cannot be cleared'); return }
       vals.created_at = editVals.added
     }
     try{
       const res = await fetch(API_BASE + '/books/' + book.id, {method: 'PUT', headers: authHeaders(true), body: JSON.stringify(vals)})
-      if(!res.ok){ setRowError(await readError(res)); return }
+      if(!res.ok){ showRowError(book.id, await readError(res)); return }
       const updated = await res.json()
       cancelEdit()
       if(onSaved) onSaved(updated, book)
-    }catch(err){ setRowError(friendlyMessage(err.message)) }
+    }catch(err){ showRowError(book.id, friendlyMessage(err.message)) }
   }
 
   if(!books || books.length===0){
@@ -1060,7 +1099,6 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
 
   return (
     <div style={{overflowX:'auto',maxWidth:'100%'}}>
-      {rowError && <div className="alert">{rowError}</div>}
       <table className="books">
         <thead><tr>
           <th>Cover</th>
@@ -1077,8 +1115,9 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
         </tr></thead>
         <tbody>
           {books.map(b=> (
-            <tr key={b.id}>
-              <td><CoverCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
+            <Fragment key={b.id}>
+            <tr>
+              <td><CoverCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
               {editingId===b.id ? (
                 <>
                   <td><input value={editVals.title} onChange={e=>setEditVals({...editVals, title: e.target.value})} /></td>
@@ -1109,10 +1148,10 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   <td className="col-title">{b.title}</td>
                   <td className="col-author">{b.author}</td>
                   <td>{b.isbn}</td>
-                  <td><SourcesCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
+                  <td><SourcesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
-                  <td><TagsCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
-                  <td className="nowrap"><FormatCell book={b} onChanged={onBookPatched} onError={setRowError} /></td>
+                  <td><TagsCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
+                  <td className="nowrap"><FormatCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="col-notes">{b.notes}</td>
                   <td className="nowrap">{formatAdded(b.created_at)}</td>
                   <td className="nowrap">
@@ -1122,6 +1161,12 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                 </>
               )}
             </tr>
+            {rowError && rowError.bookId===b.id && (
+              <tr className="row-error">
+                <td colSpan={11}><div className="alert">{rowError.message}</div></td>
+              </tr>
+            )}
+            </Fragment>
           ))}
         </tbody>
       </table>
