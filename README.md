@@ -12,7 +12,8 @@ anywhere Docker does — it was built to live on a Synology NAS.
 - Record where each book physically lives, on shelves you define yourself.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
 - Format: the binding — Hardcover, Paperback and so on — taken from OpenLibrary
-  per book, editable by hand.
+  per book, editable by hand, and filterable, including "no format" for the
+  books still missing one.
 - Cover images are downloaded from OpenLibrary and stored in the database, with
   a manual lookup/upload button for books that are missing one.
 - Bulk import from CSV.
@@ -134,7 +135,7 @@ All routes except `/health` and `/token` require an
 | -------- | ----------------- | ---------------------------------------- |
 | `GET`    | `/health`         | Liveness check                           |
 | `POST`   | `/token`          | Exchange username/password for a JWT     |
-| `GET`    | `/books`          | List books, optional `?q=` search + `?sort=`/`?dir=` + `?tags=`/`?match=` |
+| `GET`    | `/books`          | List books, optional `?q=` search + `?sort=`/`?dir=` + `?tags=`/`?match=` + `?format=`/`?has_format=` |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
 | `PUT`    | `/books/{id}`     | Update a book                            |

@@ -1140,6 +1140,9 @@ export default function App(){
   const [sort,setSort]=useState({field:'added', dir:'desc'})
   const [allTags,setAllTags]=useState([])
   const [selectedTags,setSelectedTags]=useState([])
+  // '' is any format, '__none__' is the books with none recorded.
+  const [formatFilter,setFormatFilter]=useState('')
+  const [formatsInUse,setFormatsInUse]=useState([])
   const [tagMatch,setTagMatch]=useState('any')
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
@@ -1163,12 +1166,17 @@ export default function App(){
     const term = t(query===undefined ? q : query)
     const s = sortOverride || sort
     const f = filterOverride || {tags: selectedTags, match: tagMatch}
+    const fmt = f.format===undefined ? formatFilter : f.format
     const params = [`sort=${s.field}`, `dir=${s.dir}`]
     if(term) params.push('q=' + encodeURIComponent(term))
     if(f.tags && f.tags.length){
       params.push('tags=' + encodeURIComponent(f.tags.join(',')))
       params.push('match=' + f.match)
     }
+    // "No format" is its own question rather than a value, so it travels as
+    // has_format=false instead of as a magic binding name.
+    if(fmt==='__none__') params.push('has_format=false')
+    else if(fmt) params.push('format=' + encodeURIComponent(fmt))
     const res = await fetch(API_BASE + '/books?' + params.join('&'), {headers: authHeaders()})
     if(res.status===401){ setLoggedIn(false); return }
     // The API already applied the ordering, so keep the response order as-is.
@@ -1192,6 +1200,18 @@ export default function App(){
   const changeTagMatch = (mode)=>{
     setTagMatch(mode)
     if(selectedTags.length) fetchBooks(undefined, undefined, {tags: selectedTags, match: mode})
+  }
+
+  const changeFormatFilter = (value)=>{
+    setFormatFilter(value)
+    fetchBooks(undefined, undefined, {tags: selectedTags, match: tagMatch, format: value})
+  }
+
+  const fetchFormats = async ()=>{
+    try{
+      const res = await fetch(API_BASE + '/formats', {headers: authHeaders()})
+      if(res.ok){ const d = await res.json(); setFormatsInUse(d.in_use || []) }
+    }catch(e){ console.error('fetch formats failed', e) }
   }
 
   const clearTagFilter = ()=>{
@@ -1219,7 +1239,7 @@ export default function App(){
     fetchTags()
   }
 
-  useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves() } }, [loggedIn])
+  useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() } }, [loggedIn])
 
   const setUndoWithTimeout = (u)=>{
     if(undoTimer) clearTimeout(undoTimer)
@@ -1292,9 +1312,12 @@ export default function App(){
     setBooks(prev=> prev.map(x=> x.id===updated.id ? {...x, ...updated} : x))
     setRecent(prev=> prev.map(x=> x.id===updated.id ? {...x, ...updated} : x))
     fetchTags()
+    // A lookup can introduce a binding nothing else had, which should show up
+    // in the filter rather than waiting for a reload.
+    fetchFormats()
   }
 
-  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]) }
+  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setFormatFilter(''); setFormatsInUse([]) }
 
   return (
     <div className={loggedIn ? 'container wide' : 'container'}>
@@ -1319,7 +1342,7 @@ export default function App(){
           )}
           <div className="tabs">
             <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>
-            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves() }}>Manage</button>
+            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() }}>Manage</button>
             <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>
           </div>
 
@@ -1345,6 +1368,12 @@ export default function App(){
                 <input placeholder="Search title, author or ISBN" value={q} onChange={e=>setQ(e.target.value)} />
                 <button type="submit">Search</button>
                 <button type="button" onClick={()=>{ setQ(''); fetchBooks('') }}>Clear</button>
+                <select value={formatFilter} onChange={e=>changeFormatFilter(e.target.value)}
+                        title="Show only one binding">
+                  <option value="">Any format</option>
+                  {formatsInUse.map(f=> <option key={f} value={f}>{f}</option>)}
+                  <option value="__none__">No format</option>
+                </select>
               </form>
               <TagFilter tags={allTags} selected={selectedTags} match={tagMatch}
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}

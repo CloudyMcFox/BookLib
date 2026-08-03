@@ -1138,10 +1138,12 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
 def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optional[str] = None,
                tags: Optional[str] = None, match: Optional[str] = None,
                shelf_id: Optional[int] = None, placed: Optional[bool] = None,
+               format: Optional[str] = None, has_format: Optional[bool] = None,
                current_user: dict = Depends(get_current_user)):
     """List books. Optional ?q= search, ?sort=title|author|added, ?dir=asc|desc,
     ?tags=a,b with ?match=any|all (default any), ?shelf_id= to limit to one
-    shelf, and ?placed=false to find books with no location yet."""
+    shelf, ?placed=false to find books with no location yet, ?format= to limit
+    to one binding, and ?has_format=false to find the books still missing one."""
     order = order_by(sort, dir)
     where = []
     params: List = []
@@ -1156,6 +1158,20 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
 
     if placed is not None:
         where.append("shelf_id IS NOT NULL" if placed else "shelf_id IS NULL")
+
+    # Compared through clean_format so asking for "pbk." finds the Paperbacks,
+    # and NOCASE so a value typed by hand still matches the picker.
+    wanted_format = clean_format(format)
+    if wanted_format:
+        where.append("format = ? COLLATE NOCASE")
+        params.append(wanted_format)
+
+    # Separate from ?format= rather than a magic value, the way ?placed= is
+    # separate from ?shelf_id=: "no binding recorded" is a different question
+    # from "which binding", and a book could plausibly be shelved as "None".
+    if has_format is not None:
+        where.append("(format IS NOT NULL AND format <> '')" if has_format
+                     else "(format IS NULL OR format = '')")
 
     wanted = normalize_tags((tags or '').split(','))
     if wanted:
