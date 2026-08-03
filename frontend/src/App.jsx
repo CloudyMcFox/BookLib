@@ -1104,7 +1104,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
           <th>Cover</th>
           <SortHeader label="Title" field="title" sort={sort} onSort={onSort} />
           <SortHeader label="Author" field="author" sort={sort} onSort={onSort} />
-          <th>ISBN</th>
+          <th className="col-isbn">ISBN</th>
           <th>Sources</th>
           <SortHeader label="Location" field="location" sort={sort} onSort={onSort} />
           <th>Tags</th>
@@ -1122,7 +1122,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                 <>
                   <td><input value={editVals.title} onChange={e=>setEditVals({...editVals, title: e.target.value})} /></td>
                   <td><input value={editVals.author} onChange={e=>setEditVals({...editVals, author: e.target.value})} /></td>
-                  <td><input value={editVals.isbn} onChange={e=>setEditVals({...editVals, isbn: e.target.value})} /></td>
+                  <td className="col-isbn"><input value={editVals.isbn} onChange={e=>setEditVals({...editVals, isbn: e.target.value})} /></td>
                   <td>
                     <input value={editVals.olid} placeholder="OL12345M" onChange={e=>setEditVals({...editVals, olid: e.target.value})} />
                     <input style={{marginTop:4}} value={editVals.googleId} placeholder="otCEEQAAQBAJ" onChange={e=>setEditVals({...editVals, googleId: e.target.value})} />
@@ -1147,7 +1147,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                 <>
                   <td className="col-title">{b.title}</td>
                   <td className="col-author">{b.author}</td>
-                  <td>{b.isbn}</td>
+                  <td className="col-isbn nowrap">{b.isbn}</td>
                   <td><SourcesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
                   <td><TagsCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
