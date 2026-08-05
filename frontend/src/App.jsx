@@ -1416,7 +1416,7 @@ export default function App(){
             <div className="card" style={{minWidth:0}}>
               <h3>Manage library</h3>
               <form className="search-row" onSubmit={e=>{ e.preventDefault(); fetchBooks() }}>
-                <input placeholder="Search title, author or ISBN" value={q} onChange={e=>setQ(e.target.value)} />
+                <input placeholder="Search title, author, notes or ISBN" value={q} onChange={e=>setQ(e.target.value)} />
                 <button type="submit">Search</button>
                 <button type="button" onClick={()=>{ setQ(''); fetchBooks('') }}>Clear</button>
                 <select value={formatFilter} onChange={e=>changeFormatFilter(e.target.value)}

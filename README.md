@@ -135,7 +135,7 @@ All routes except `/health` and `/token` require an
 | -------- | ----------------- | ---------------------------------------- |
 | `GET`    | `/health`         | Liveness check                           |
 | `POST`   | `/token`          | Exchange username/password for a JWT     |
-| `GET`    | `/books`          | List books, optional `?q=` search + `?sort=`/`?dir=` + `?tags=`/`?match=` + `?format=`/`?has_format=` |
+| `GET`    | `/books`          | List books, optional `?q=` search (title, author, ISBN, OLID, notes) + `?sort=`/`?dir=` + `?tags=`/`?match=` + `?format=`/`?has_format=` |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
 | `PUT`    | `/books/{id}`     | Update a book                            |

@@ -1140,7 +1140,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
                shelf_id: Optional[int] = None, placed: Optional[bool] = None,
                format: Optional[str] = None, has_format: Optional[bool] = None,
                current_user: dict = Depends(get_current_user)):
-    """List books. Optional ?q= search, ?sort=title|author|added, ?dir=asc|desc,
+    """List books. Optional ?q= search over title, author, ISBN, OLID and notes,
+    ?sort=title|author|added, ?dir=asc|desc,
     ?tags=a,b with ?match=any|all (default any), ?shelf_id= to limit to one
     shelf, ?placed=false to find books with no location yet, ?format= to limit
     to one binding, and ?has_format=false to find the books still missing one."""
@@ -1149,8 +1150,11 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     params: List = []
     if q:
         pattern = f"%{q.strip()}%"
-        where.append("(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR olid LIKE ?)")
-        params.extend([pattern, pattern, pattern, pattern])
+        # Notes included: it is where "signed", "lent to Sam" and "second copy"
+        # live, which are exactly the things you go looking for and cannot find
+        # by title.
+        where.append("(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR olid LIKE ? OR notes LIKE ?)")
+        params.extend([pattern] * 5)
 
     if shelf_id is not None:
         where.append("shelf_id = ?")
