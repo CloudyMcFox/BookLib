@@ -117,6 +117,7 @@ function AddForm({onAdded}){
   const [olid,setOlid]=useState('')
   const [googleId,setGoogleId]=useState('')
   const [notes,setNotes]=useState('')
+  const [format,setFormat]=useState('')
   const [error,setError]=useState(null)
   const [loading,setLoading]=useState(false)
   const [searching,setSearching]=useState(false)
@@ -128,7 +129,9 @@ function AddForm({onAdded}){
   const submit=async e=>{
     if(e) e.preventDefault()
     setError(null)
-    const vals = {title: t(title), author: t(author), isbn: t(isbn), olid: t(olid), google_id: t(googleId), notes: t(notes)}
+    // Left blank, the server looks the binding up from the ISBN or OLID; typed,
+    // it is taken as the answer.
+    const vals = {title: t(title), author: t(author), isbn: t(isbn), olid: t(olid), google_id: t(googleId), notes: t(notes), format: t(format) || null}
     const missing = []
     if(!vals.title) missing.push('Title')
     if(!vals.author) missing.push('Author')
@@ -144,7 +147,7 @@ function AddForm({onAdded}){
       const res = await fetch(API_BASE + '/books',{method:'POST', headers: authHeaders(true), body: JSON.stringify(vals)})
       if(!res.ok){ setError(await readError(res)); return }
       const created = await res.json()
-      setTitle(''); setAuthor(''); setIsbn(''); setOlid(''); setGoogleId(''); setNotes('')
+      setTitle(''); setAuthor(''); setIsbn(''); setOlid(''); setGoogleId(''); setNotes(''); setFormat('')
       setSearchResults([])
       onAdded(created)
     }catch(err){
@@ -261,6 +264,9 @@ function AddForm({onAdded}){
           <input value={googleId} placeholder="otCEEQAAQBAJ" onChange={e=>setGoogleId(e.target.value)}/>
         </label>
         <label>Notes<input value={notes} onChange={e=>setNotes(e.target.value)}/></label>
+        <label>Format <span className="hint">(optional — looked up from OpenLibrary when left blank)</span>
+          <input list="known-formats" value={format} placeholder="Paperback" onChange={e=>setFormat(e.target.value)}/>
+        </label>
         <div style={{marginTop:8}}>
           <button type="button" className="danger" onClick={()=>submit()}>Manually add</button>
         </div>
@@ -1132,9 +1138,6 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   <td>
                     <input list="known-formats" value={editVals.format} placeholder="Paperback"
                            onChange={e=>setEditVals({...editVals, format: e.target.value})} />
-                    <datalist id="known-formats">
-                      {KNOWN_FORMATS.map(f=> <option key={f} value={f} />)}
-                    </datalist>
                   </td>
                   <td className="col-notes"><input value={editVals.notes} onChange={e=>setEditVals({...editVals, notes: e.target.value})} /></td>
                   <td><input type="date" value={editVals.added} onChange={e=>setEditVals({...editVals, added: e.target.value})} /></td>
@@ -1366,6 +1369,9 @@ export default function App(){
 
   return (
     <div className={loggedIn ? 'container wide' : 'container'}>
+      <datalist id="known-formats">
+        {KNOWN_FORMATS.map(f=> <option key={f} value={f} />)}
+      </datalist>
       <div className="header">
         <h1>Book Library</h1>
         {loggedIn && <button onClick={logout}>Logout</button>}
