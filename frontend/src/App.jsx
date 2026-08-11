@@ -447,12 +447,21 @@ function CoverCell({book, onChanged, onError}){
   )
 }
 
-function TagFilter({tags, selected, match, onToggle, onMatchChange, onClear, onRefreshAll, refreshing}){
+function TagFilter({tags, selected, excluded, match, onToggle, onMatchChange, onClear, onRefreshAll, refreshing}){
   const [showAll,setShowAll] = useState(false)
+  const [mode,setMode] = useState('include')
+  const [order,setOrder] = useState('count')
   if((!tags || tags.length===0) && !onRefreshAll) return null
-  // Most used first, but keep selected tags visible even when the list is capped.
-  const ordered = [...(tags||[])].sort((a,b)=> b.count-a.count || a.name.localeCompare(b.name))
-  const visible = showAll ? ordered : ordered.filter(x=> selected.includes(x.name)).concat(ordered.filter(x=> !selected.includes(x.name))).slice(0,20)
+  // Most used first, but keep active include/exclude tags visible even when the
+  // list is capped.
+  const ordered = [...(tags||[])].sort((a,b)=>
+    order==='alpha'
+      ? a.name.localeCompare(b.name)
+      : b.count-a.count || a.name.localeCompare(b.name))
+  const active = new Set([...selected, ...excluded])
+  const visible = showAll
+    ? ordered
+    : ordered.filter(x=> active.has(x.name)).concat(ordered.filter(x=> !active.has(x.name))).slice(0,20)
 
   return (
     <div className="tag-filter">
@@ -464,7 +473,14 @@ function TagFilter({tags, selected, match, onToggle, onMatchChange, onClear, onR
             Match all selected
           </label>
         )}
-        {selected.length>0 && <button type="button" onClick={onClear}>Clear tags</button>}
+        {(selected.length>0 || excluded.length>0) && <button type="button" onClick={onClear}>Clear tags</button>}
+        <label className="tag-order">
+          Order
+          <select value={order} onChange={e=>setOrder(e.target.value)}>
+            <option value="count">Most used</option>
+            <option value="alpha">Alphabetical (A–Z)</option>
+          </select>
+        </label>
         {onRefreshAll && (
           <button type="button" onClick={onRefreshAll} disabled={!!refreshing} style={{marginLeft:'auto'}}
                   title="Re-fetch genres from OpenLibrary for every book listed below">
@@ -472,14 +488,35 @@ function TagFilter({tags, selected, match, onToggle, onMatchChange, onClear, onR
           </button>
         )}
       </div>
+      <div className="tag-filter-mode" role="group" aria-label="Tag filter mode">
+        <button type="button" className={mode==='include' ? 'active include' : ''}
+                onClick={()=>setMode('include')} aria-pressed={mode==='include'}>
+          Include
+        </button>
+        <button type="button" className={mode==='exclude' ? 'active exclude' : ''}
+                onClick={()=>setMode('exclude')} aria-pressed={mode==='exclude'}>
+          Exclude
+        </button>
+        <span>
+          {mode==='include'
+            ? 'Click tags to require them in the results.'
+            : 'Click tags to hide any book that has them.'}
+        </span>
+      </div>
       <div className="tag-cloud">
-        {visible.map(tag=> (
-          <button key={tag.name} type="button"
-                  className={selected.includes(tag.name) ? 'tag selectable selected' : 'tag selectable'}
-                  onClick={()=>onToggle(tag.name)}>
-            {tag.name} <span className="tag-count">{tag.count}</span>
-          </button>
-        ))}
+        {visible.map(tag=>{
+          const included = selected.includes(tag.name)
+          const isExcluded = excluded.includes(tag.name)
+          return (
+            <button key={tag.name} type="button"
+                    className={['tag','selectable',included?'selected':'',isExcluded?'excluded':''].filter(Boolean).join(' ')}
+                    onClick={()=>onToggle(tag.name, mode)}
+                    title={included ? 'Included in results' : isExcluded ? 'Excluded from results' : `Add to ${mode} tags`}>
+              {isExcluded && <span aria-hidden="true">− </span>}
+              {tag.name} <span className="tag-count">{tag.count}</span>
+            </button>
+          )
+        })}
         {ordered.length>visible.length && <button type="button" className="tag selectable" onClick={()=>setShowAll(true)}>+{ordered.length-visible.length} more</button>}
         {showAll && <button type="button" className="tag selectable" onClick={()=>setShowAll(false)}>Show fewer</button>}
       </div>
@@ -1638,10 +1675,13 @@ export default function App(){
   const [sort,setSort]=useState({field:'added', dir:'desc'})
   const [allTags,setAllTags]=useState([])
   const [selectedTags,setSelectedTags]=useState([])
+  const [excludedTags,setExcludedTags]=useState([])
   // '' is any format, '__none__' is the books with none recorded.
   const [formatFilter,setFormatFilter]=useState('')
+  // '' is every shelf, '__unplaced__' is books with no recorded location.
+  const [shelfFilter,setShelfFilter]=useState('')
   const [formatsInUse,setFormatsInUse]=useState([])
-  const [tagMatch,setTagMatch]=useState('any')
+  const [tagMatch,setTagMatch]=useState('all')
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
   const [placing,setPlacing]=useState(null)
@@ -1667,7 +1707,8 @@ export default function App(){
   const fetchBooks = async (query, sortOverride, filterOverride)=>{
     const term = t(query===undefined ? q : query)
     const s = sortOverride || sort
-    const f = filterOverride || {tags: selectedTags, match: tagMatch}
+    const f = {tags: selectedTags, excludes: excludedTags, match: tagMatch,
+               shelf: shelfFilter, ...(filterOverride || {})}
     const fmt = f.format===undefined ? formatFilter : f.format
     const params = [`sort=${s.field}`, `dir=${s.dir}`]
     if(term) params.push('q=' + encodeURIComponent(term))
@@ -1675,6 +1716,11 @@ export default function App(){
       params.push('tags=' + encodeURIComponent(f.tags.join(',')))
       params.push('match=' + f.match)
     }
+    if(f.excludes && f.excludes.length){
+      params.push('exclude_tags=' + encodeURIComponent(f.excludes.join(',')))
+    }
+    if(f.shelf==='__unplaced__') params.push('placed=false')
+    else if(f.shelf) params.push('shelf_id=' + encodeURIComponent(f.shelf))
     // "No format" is its own question rather than a value, so it travels as
     // has_format=false instead of as a magic binding name.
     if(fmt==='__none__') params.push('has_format=false')
@@ -1693,20 +1739,35 @@ export default function App(){
     fetchBooks(undefined, next)
   }
 
-  const toggleTag = (name)=>{
-    const next = selectedTags.includes(name) ? selectedTags.filter(x=> x!==name) : [...selectedTags, name]
-    setSelectedTags(next)
-    fetchBooks(undefined, undefined, {tags: next, match: tagMatch})
+  const toggleTag = (name, mode)=>{
+    if(mode==='exclude'){
+      const excludes = excludedTags.includes(name) ? excludedTags.filter(x=> x!==name) : [...excludedTags, name]
+      const includes = selectedTags.filter(x=> x!==name)
+      setExcludedTags(excludes)
+      setSelectedTags(includes)
+      fetchBooks(undefined, undefined, {tags: includes, excludes})
+      return
+    }
+    const includes = selectedTags.includes(name) ? selectedTags.filter(x=> x!==name) : [...selectedTags, name]
+    const excludes = excludedTags.filter(x=> x!==name)
+    setSelectedTags(includes)
+    setExcludedTags(excludes)
+    fetchBooks(undefined, undefined, {tags: includes, excludes})
   }
 
   const changeTagMatch = (mode)=>{
     setTagMatch(mode)
-    if(selectedTags.length) fetchBooks(undefined, undefined, {tags: selectedTags, match: mode})
+    if(selectedTags.length) fetchBooks(undefined, undefined, {match: mode})
   }
 
   const changeFormatFilter = (value)=>{
     setFormatFilter(value)
-    fetchBooks(undefined, undefined, {tags: selectedTags, match: tagMatch, format: value})
+    fetchBooks(undefined, undefined, {format: value})
+  }
+
+  const changeShelfFilter = (value)=>{
+    setShelfFilter(value)
+    fetchBooks(undefined, undefined, {shelf: value})
   }
 
   const fetchFormats = async ()=>{
@@ -1718,7 +1779,8 @@ export default function App(){
 
   const clearTagFilter = ()=>{
     setSelectedTags([])
-    fetchBooks(undefined, undefined, {tags: [], match: tagMatch})
+    setExcludedTags([])
+    fetchBooks(undefined, undefined, {tags: [], excludes: []})
   }
 
   // Re-fetch genres for every listed book, one at a time so we stay polite to
@@ -1771,6 +1833,16 @@ export default function App(){
   }, [readOnly])
 
   useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() } }, [loggedIn])
+
+  // If an administrator deletes the shelf currently being filtered, return to
+  // all shelves instead of leaving the Manage tab stuck on an impossible id.
+  useEffect(()=>{
+    if(shelfFilter && shelfFilter!=='__unplaced__'
+       && !shelves.some(s=> String(s.id)===String(shelfFilter))){
+      setShelfFilter('')
+      fetchBooks(undefined, undefined, {shelf: ''})
+    }
+  }, [shelves, shelfFilter])
 
   const setUndoWithTimeout = (u)=>{
     if(undoTimer) clearTimeout(undoTimer)
@@ -1848,7 +1920,7 @@ export default function App(){
     fetchFormats()
   }
 
-  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setFormatFilter(''); setFormatsInUse([]) }
+  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setExcludedTags([]); setFormatFilter(''); setShelfFilter(''); setFormatsInUse([]) }
 
   return (
     <ReadOnlyContext.Provider value={readOnly}>
@@ -1925,8 +1997,14 @@ export default function App(){
                   {formatsInUse.map(f=> <option key={f} value={f}>{f}</option>)}
                   <option value="__none__">No format</option>
                 </select>
+                <select value={shelfFilter} onChange={e=>changeShelfFilter(e.target.value)}
+                        title="Show books on one shelf">
+                  <option value="">Any shelf</option>
+                  {shelves.map(s=> <option key={s.id} value={String(s.id)}>{s.name}</option>)}
+                  <option value="__unplaced__">Not placed</option>
+                </select>
               </form>
-              <TagFilter tags={allTags} selected={selectedTags} match={tagMatch}
+              <TagFilter tags={allTags} selected={selectedTags} excluded={excludedTags} match={tagMatch}
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}
                          onRefreshAll={(books.length && !readOnly) ? refreshAllTags : null} refreshing={refreshing} />
               <div style={{margin:'8px 0',color:'#666',fontSize:13}}>{books.length} book{books.length===1?'':'s'}</div>

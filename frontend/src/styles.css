@@ -83,9 +83,18 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .tag.selectable{cursor:pointer}
 .tag.selectable:hover:not(:disabled){background:#e0e7ff}
 .tag.selected{background:#2563eb;border-color:#2563eb;color:#fff}
+.tag.excluded{background:#fee2e2;border-color:#ef4444;color:#991b1b;text-decoration:line-through}
+.tag.excluded:hover:not(:disabled){background:#fecaca}
 .tag.more{cursor:pointer;background:#fff;border-style:dashed;color:#666;font-size:11px}
 .tag-count{opacity:.65;font-size:11px}
 .tag-list{display:flex;flex-wrap:wrap;gap:4px}
+.tag-filter-mode{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin:6px 0}
+.tag-filter-mode button{padding:3px 9px;font-size:12px}
+.tag-filter-mode button.active.include{background:#2563eb;border-color:#2563eb;color:#fff}
+.tag-filter-mode button.active.exclude{background:#dc2626;border-color:#dc2626;color:#fff}
+.tag-filter-mode span{font-size:12px;color:#666;margin-left:3px}
+.tag-order{display:flex;align-items:center;gap:5px;margin:0;font-size:12px;color:#666;white-space:nowrap}
+.tag-order select{padding:3px 6px;border:1px solid #ccd0d5;border-radius:5px;background:#fff;font-size:12px}
 .tags-cell{display:flex;flex-direction:column;gap:6px;min-width:150px;max-width:240px}
 .format-cell{display:flex;flex-direction:column;gap:6px}
 .format-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}

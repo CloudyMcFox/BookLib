@@ -1194,14 +1194,16 @@ def read_me(current_user: dict = Depends(get_current_user)):
 @app.get("/books", response_model=List[Book])
 def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optional[str] = None,
                tags: Optional[str] = None, match: Optional[str] = None,
+               exclude_tags: Optional[str] = None,
                shelf_id: Optional[int] = None, placed: Optional[bool] = None,
                format: Optional[str] = None, has_format: Optional[bool] = None,
                current_user: dict = Depends(get_current_user)):
     """List books. Optional ?q= search over title, author, ISBN, OLID and notes,
     ?sort=title|author|added, ?dir=asc|desc,
-    ?tags=a,b with ?match=any|all (default any), ?shelf_id= to limit to one
-    shelf, ?placed=false to find books with no location yet, ?format= to limit
-    to one binding, and ?has_format=false to find the books still missing one."""
+    ?tags=a,b with ?match=any|all (default any), ?exclude_tags=a,b to omit
+    books having any listed tag, ?shelf_id= to limit to one shelf,
+    ?placed=false to find books with no location yet, ?format= to limit to one
+    binding, and ?has_format=false to find the books still missing one."""
     order = order_by(sort, dir)
     where = []
     params: List = []
@@ -1245,6 +1247,15 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         params.extend(wanted)
         if having:
             params.append(len(wanted))
+
+    excluded = normalize_tags((exclude_tags or '').split(','))
+    if excluded:
+        placeholders = ",".join("?" * len(excluded))
+        where.append(f"""NOT EXISTS (SELECT 1 FROM book_tags bt
+                                      JOIN tags t ON t.id = bt.tag_id
+                                      WHERE bt.book_id = books.id
+                                        AND t.name IN ({placeholders}))""")
+        params.extend(excluded)
 
     sql = f"SELECT {BOOK_COLUMNS} FROM books"
     if where:
@@ -2186,4 +2197,3 @@ def diagnose_sources(isbn: str, title: Optional[str] = None, author: Optional[st
         clean(title) or (report.get("google") or {}).get("title") or (report.get("openlibrary") or {}).get("title"),
         clean(author) or ", ".join((report.get("google") or {}).get("authors") or []) or None)
     return report
-

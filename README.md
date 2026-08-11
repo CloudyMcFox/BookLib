@@ -170,7 +170,7 @@ anything; a token from `/token/guest` gets `guest` and is read-only — every
 | `POST`   | `/token/guest`    | Get a read-only guest JWT, no credentials |
 | `GET`    | `/auth/config`    | Whether guest access is enabled          |
 | `GET`    | `/me`             | Caller's username, role and `read_only` flag |
-| `GET`    | `/books`          | List books, optional `?q=` search (title, author, ISBN, OLID, notes) + `?sort=`/`?dir=` + `?tags=`/`?match=` + `?format=`/`?has_format=` |
+| `GET`    | `/books`          | List books, optional `?q=` search + sorting + include/exclude tags + `?shelf_id=`/`?placed=` + format filters |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
 | `PUT`    | `/books/{id}`     | Update a book                            |
