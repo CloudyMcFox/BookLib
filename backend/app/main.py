@@ -20,6 +20,18 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-to-a-secure-random-string")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 8))
 
+# Guest access: anyone can take a read-only look at the library without an
+# account. Guests are not rows in users, they are only a claim in the token, so
+# there is no password to leak and nothing to keep in sync. Set
+# GUEST_ACCESS_ENABLED=false to turn the door off entirely.
+GUEST_ACCESS_ENABLED = os.environ.get("GUEST_ACCESS_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+GUEST_USERNAME = "guest"
+ROLE_GUEST = "guest"
+ROLE_ADMIN = "admin"
+# Guest sessions are short: the token is handed out without any proof of
+# identity, so it should not stay valid for a working day.
+GUEST_TOKEN_EXPIRE_MINUTES = int(os.environ.get("GUEST_TOKEN_EXPIRE_MINUTES", 120))
+
 # Google Books is used as a fallback when OpenLibrary has no genres, cover or
 # metadata for a book. An API key is optional but strongly recommended: without
 # one Google shares a per-IP anonymous quota that is regularly exhausted, and
@@ -613,6 +625,17 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     return _user_from_token(token)
 
 
+def require_editor(current_user: dict = Depends(get_current_user)):
+    """Dependency for anything that writes. Guests may look, not touch."""
+    if is_guest(current_user):
+        raise HTTPException(status_code=403, detail="Guest accounts are read-only")
+    return current_user
+
+
+def is_guest(user: Optional[dict]) -> bool:
+    return bool(user) and user.get('role') == ROLE_GUEST
+
+
 def _user_from_token(token: str):
     credentials_exception = HTTPException(
         status_code=401,
@@ -625,10 +648,16 @@ def _user_from_token(token: str):
             raise credentials_exception
     except JWTError:
         raise credentials_exception
+    # A guest is identified by the role claim rather than by the name, so a real
+    # account that happens to be called "guest" keeps its normal rights.
+    if payload.get("role") == ROLE_GUEST:
+        if not GUEST_ACCESS_ENABLED:
+            raise credentials_exception
+        return {"id": None, "username": username, "role": ROLE_GUEST}
     user = get_user(username)
     if user is None:
         raise credentials_exception
-    return user
+    return {**user, "role": ROLE_ADMIN}
 
 
 async def get_current_user_flexible(request: Request, token: Optional[str] = None):
@@ -1131,8 +1160,36 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect username or password")
-    access_token = create_access_token(data={"sub": user['username']})
+    access_token = create_access_token(data={"sub": user['username'], "role": ROLE_ADMIN})
     return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.post("/token/guest", response_model=Token)
+def guest_access_token():
+    """Hand out a read-only token. No credentials: the whole point is that a
+    visitor can browse the library without an account."""
+    if not GUEST_ACCESS_ENABLED:
+        raise HTTPException(status_code=404, detail="Guest access is disabled")
+    access_token = create_access_token(data={"sub": GUEST_USERNAME, "role": ROLE_GUEST},
+                                       expires_delta=timedelta(minutes=GUEST_TOKEN_EXPIRE_MINUTES))
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/auth/config")
+def auth_config():
+    """What the login screen needs to know before anyone has signed in."""
+    return {"guest_access_enabled": GUEST_ACCESS_ENABLED}
+
+
+@app.get("/me")
+def read_me(current_user: dict = Depends(get_current_user)):
+    """Who the caller is and what they are allowed to do."""
+    return {
+        "username": current_user.get('username'),
+        "role": current_user.get('role', ROLE_ADMIN),
+        "read_only": is_guest(current_user),
+    }
+
 
 @app.get("/books", response_model=List[Book])
 def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optional[str] = None,
@@ -1205,7 +1262,7 @@ def list_shelves(current_user: dict = Depends(get_current_user)):
 
 
 @app.post("/shelves", response_model=Shelf)
-def add_shelf(s: Shelf, current_user: dict = Depends(get_current_user)):
+def add_shelf(s: Shelf, current_user: dict = Depends(require_editor)):
     name = clean(s.name)
     if not name:
         raise HTTPException(status_code=400, detail="A shelf needs a name")
@@ -1217,7 +1274,7 @@ def add_shelf(s: Shelf, current_user: dict = Depends(get_current_user)):
 
 
 @app.put("/shelves/{shelf_id}", response_model=Shelf)
-def update_shelf(shelf_id: int, s: Shelf, current_user: dict = Depends(get_current_user)):
+def update_shelf(shelf_id: int, s: Shelf, current_user: dict = Depends(require_editor)):
     """Rename or resize a shelf.
 
     Shrinking is refused when books are sitting in the slots that would be cut
@@ -1248,7 +1305,7 @@ def update_shelf(shelf_id: int, s: Shelf, current_user: dict = Depends(get_curre
 
 
 @app.delete("/shelves/{shelf_id}")
-def delete_shelf(shelf_id: int, current_user: dict = Depends(get_current_user)):
+def delete_shelf(shelf_id: int, current_user: dict = Depends(require_editor)):
     """Delete a shelf. Books on it are unplaced, never deleted."""
     if not get_shelf(shelf_id):
         raise HTTPException(status_code=404, detail="Not found")
@@ -1286,7 +1343,7 @@ def list_tags(current_user: dict = Depends(get_current_user)):
     return [{"name": r['name'], "count": r['count']} for r in cur.fetchall()]
 
 @app.delete("/books/{book_id}")
-def delete_book(book_id: int, current_user: dict = Depends(get_current_user)):
+def delete_book(book_id: int, current_user: dict = Depends(require_editor)):
     cur = conn.execute("DELETE FROM books WHERE id=?", (book_id,))
     conn.execute("DELETE FROM book_tags WHERE book_id=?", (book_id,))
     prune_orphan_tags()
@@ -1294,7 +1351,7 @@ def delete_book(book_id: int, current_user: dict = Depends(get_current_user)):
     return {"deleted": cur.rowcount}
 
 @app.put("/books/{book_id}", response_model=Book)
-def update_book(book_id: int, b: Book, current_user: dict = Depends(get_current_user)):
+def update_book(book_id: int, b: Book, current_user: dict = Depends(require_editor)):
     """Update an existing book. All fields in the payload will overwrite stored
     values, except created_at and the shelf location, which are only touched
     when the caller actually sends them."""
@@ -1337,7 +1394,7 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(get_current_
     return book_from_row(row)
 
 @app.post("/books", response_model=Book)
-def add_book(b: Book, current_user: dict = Depends(get_current_user)):
+def add_book(b: Book, current_user: dict = Depends(require_editor)):
     title = clean(b.title)
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
@@ -1387,7 +1444,7 @@ def get_book_cover(book_id: int, current_user: dict = Depends(get_current_user_f
                     headers={"Cache-Control": "private, max-age=60"})
 
 @app.post("/books/{book_id}/cover/lookup", response_model=Book)
-def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_user: dict = Depends(require_editor)):
     """Find a cover for an existing book (by explicit URL, stored OLID, or ISBN),
     falling back to Google Books when OpenLibrary has none."""
     cur = conn.execute("SELECT id, isbn, olid, google_id FROM books WHERE id=?", (book_id,))
@@ -1403,7 +1460,7 @@ def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_use
     return book_from_row(cur.fetchone())
 
 @app.post("/books/{book_id}/tags/lookup", response_model=Book)
-def lookup_book_tags(book_id: int, replace: bool = False, current_user: dict = Depends(get_current_user)):
+def lookup_book_tags(book_id: int, replace: bool = False, current_user: dict = Depends(require_editor)):
     """Fetch genre tags from OpenLibrary, falling back to Google Books
     categories. Adds to the book's tags by default; pass replace=true to swap
     them out (used by the Refresh button, so stale or
@@ -1422,7 +1479,7 @@ def lookup_book_tags(book_id: int, replace: bool = False, current_user: dict = D
     return book_from_row(cur.fetchone(), tags)
 
 @app.post("/books/{book_id}/olid/lookup", response_model=Book)
-def lookup_book_olid(book_id: int, current_user: dict = Depends(get_current_user)):
+def lookup_book_olid(book_id: int, current_user: dict = Depends(require_editor)):
     """Resolve the OpenLibrary edition id for an existing book from its ISBN."""
     cur = conn.execute("SELECT id, isbn FROM books WHERE id=?", (book_id,))
     row = cur.fetchone()
@@ -1439,7 +1496,7 @@ def lookup_book_olid(book_id: int, current_user: dict = Depends(get_current_user
     return book_from_row(cur.fetchone())
 
 @app.post("/books/{book_id}/format/lookup", response_model=Book)
-def lookup_book_format(book_id: int, current_user: dict = Depends(get_current_user)):
+def lookup_book_format(book_id: int, current_user: dict = Depends(require_editor)):
     """Fetch the binding for one book from OpenLibrary.
 
     Per book rather than across the library: unlike a cover, a wrong answer here
@@ -1474,7 +1531,7 @@ def list_formats(current_user: dict = Depends(get_current_user)):
     return {"known": KNOWN_FORMATS, "in_use": in_use, "other": extra}
 
 @app.post("/books/{book_id}/google/lookup", response_model=Book)
-def lookup_book_google_id(book_id: int, current_user: dict = Depends(get_current_user)):
+def lookup_book_google_id(book_id: int, current_user: dict = Depends(require_editor)):
     """Resolve the Google Books volume id for an existing book.
 
     Storing it lets later tag and cover lookups go straight to the volume record
@@ -1494,7 +1551,7 @@ def lookup_book_google_id(book_id: int, current_user: dict = Depends(get_current
     return book_from_row(cur.fetchone())
 
 @app.post("/books/{book_id}/cover", response_model=Book)
-async def upload_book_cover(book_id: int, file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def upload_book_cover(book_id: int, file: UploadFile = File(...), current_user: dict = Depends(require_editor)):
     """Upload a cover image manually."""
     cur = conn.execute("SELECT id FROM books WHERE id=?", (book_id,))
     if not cur.fetchone():
@@ -1511,7 +1568,7 @@ async def upload_book_cover(book_id: int, file: UploadFile = File(...), current_
     return book_from_row(cur.fetchone())
 
 @app.delete("/books/{book_id}/cover", response_model=Book)
-def delete_book_cover(book_id: int, current_user: dict = Depends(get_current_user)):
+def delete_book_cover(book_id: int, current_user: dict = Depends(require_editor)):
     conn.execute("UPDATE books SET cover=NULL, cover_mime=NULL WHERE id=?", (book_id,))
     conn.commit()
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
@@ -1528,7 +1585,7 @@ class BookLocation(BaseModel):
 
 
 @app.put("/books/{book_id}/location", response_model=Book)
-def set_book_location(book_id: int, loc: BookLocation, current_user: dict = Depends(get_current_user)):
+def set_book_location(book_id: int, loc: BookLocation, current_user: dict = Depends(require_editor)):
     """Set or clear where a book lives.
 
     Separate from PUT /books/{id} so placing a book from the shelf picker cannot
@@ -1544,7 +1601,7 @@ def set_book_location(book_id: int, loc: BookLocation, current_user: dict = Depe
 
 
 @app.post("/books/import")
-async def import_books(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def import_books(file: UploadFile = File(...), current_user: dict = Depends(require_editor)):
     """Accepts a CSV file with headers: title,author,isbn,olid,google_id,tags,notes
     (tags separated by ';' or '|', since ',' is the column separator)"""
     content = (await file.read()).decode('utf-8')

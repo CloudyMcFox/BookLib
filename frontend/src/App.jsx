@@ -1,4 +1,4 @@
-import React, { Fragment, useState, useEffect, useRef } from 'react'
+import React, { Fragment, createContext, useContext, useState, useEffect, useRef } from 'react'
 
 // Backend URL. Set VITE_API_BASE at build time (see .env / docker-compose.yml).
 // Falls back to the current origin, which works when a reverse proxy serves
@@ -80,6 +80,12 @@ function authHeaders(json){
   return h
 }
 
+// Guests get a token like anyone else, it just carries a read-only role. The
+// server is what enforces that; this context only keeps the UI honest, so the
+// buttons a guest cannot use are never shown in the first place.
+const ReadOnlyContext = createContext(false)
+const useReadOnly = ()=> useContext(ReadOnlyContext)
+
 // <img> cannot send an Authorization header, so the token rides along in the query
 // string. cacheBust changes whenever a cover is replaced so the browser refetches.
 function coverUrl(book, cacheBust){
@@ -91,6 +97,22 @@ function Login({onLogin}){
   const [username,setUsername]=useState('')
   const [password,setPassword]=useState('')
   const [error,setError]=useState(null)
+  const [guestAllowed,setGuestAllowed]=useState(false)
+  const [busy,setBusy]=useState(false)
+
+  useEffect(()=>{
+    let cancelled = false
+    ;(async ()=>{
+      try{
+        const res = await fetch(API_BASE + '/auth/config')
+        if(!res.ok) return
+        const cfg = await res.json()
+        if(!cancelled) setGuestAllowed(!!cfg.guest_access_enabled)
+      }catch(_){ /* leave the guest button hidden */ }
+    })()
+    return ()=>{ cancelled = true }
+  }, [])
+
   const submit=async e=>{
     e.preventDefault()
     setError(null)
@@ -99,6 +121,19 @@ function Login({onLogin}){
     if(!res.ok){ setError('Login failed - check username and password'); return }
     const j = await res.json(); localStorage.setItem('token', j.access_token); onLogin();
   }
+
+  const guest=async ()=>{
+    setError(null); setBusy(true)
+    try{
+      const res = await fetch(API_BASE + '/token/guest',{method:'POST'})
+      if(!res.ok){ setError(await readError(res)); return }
+      const j = await res.json()
+      localStorage.setItem('token', j.access_token)
+      onLogin()
+    }catch(err){ setError(friendlyMessage(err.message)) }
+    finally{ setBusy(false) }
+  }
+
   return (
     <form onSubmit={submit} className="card">
       <h3>Login</h3>
@@ -106,6 +141,14 @@ function Login({onLogin}){
       <label>Username<input value={username} onChange={e=>setUsername(e.target.value)}/></label>
       <label>Password<input type="password" value={password} onChange={e=>setPassword(e.target.value)}/></label>
       <button type="submit">Login</button>
+      {guestAllowed && (
+        <div className="guest-login">
+          <button type="button" onClick={guest} disabled={busy}>
+            {busy ? 'Opening...' : 'Browse as guest'}
+          </button>
+          <span className="muted">Look around and search the library. Guests cannot add, edit or delete books.</span>
+        </div>
+      )}
     </form>
   )
 }
@@ -331,6 +374,7 @@ function AddForm({onAdded}){
 }
 
 function CoverCell({book, onChanged, onError}){
+  const readOnly = useReadOnly()
   const [busy,setBusy]=useState(false)
   const [version,setVersion]=useState(0)
   const fileRef = useRef(null)
@@ -391,11 +435,13 @@ function CoverCell({book, onChanged, onError}){
         ? <img className="cover-thumb" src={coverUrl(book, version)} alt={`Cover of ${book.title}`} />
         : <div className="cover-thumb cover-thumb-empty">No cover</div>}
       <div className="cover-actions">
+        {!readOnly && <>
         {!book.has_cover && <button type="button" onClick={lookup} disabled={busy}>{busy? '...' : 'Lookup'}</button>}
         {book.has_cover && <button type="button" onClick={remove} disabled={busy}>Remove</button>}
         <button type="button" onClick={()=>fileRef.current && fileRef.current.click()} disabled={busy}>Upload</button>
         <button type="button" onClick={fromUrl} disabled={busy}>From URL</button>
         <input ref={fileRef} type="file" accept="image/*" style={{display:'none'}} onChange={e=>upload(e.target.files && e.target.files[0])} />
+        </>}
       </div>
     </div>
   )
@@ -444,6 +490,7 @@ function TagFilter({tags, selected, match, onToggle, onMatchChange, onClear, onR
 const TAGS_SHOWN = 3
 
 function TagsCell({book, onChanged, onError}){
+  const readOnly = useReadOnly()
   const [busy,setBusy]=useState(false)
   const [showAll,setShowAll]=useState(false)
   const tags = book.tags || []
@@ -477,10 +524,12 @@ function TagsCell({book, onChanged, onError}){
             )}
           </div>
         : <span className="muted">No tags</span>}
-      <button type="button" onClick={lookup} disabled={busy}
-              title="Fetch genres from OpenLibrary or Google Books">
-        {busy ? '...' : (tags.length ? 'Refresh tags' : 'Lookup tags')}
-      </button>
+      {!readOnly && (
+        <button type="button" onClick={lookup} disabled={busy}
+                title="Fetch genres from OpenLibrary or Google Books">
+          {busy ? '...' : (tags.length ? 'Refresh tags' : 'Lookup tags')}
+        </button>
+      )}
     </div>
   )
 }
@@ -493,6 +542,7 @@ const KNOWN_FORMATS = ['Hardcover', 'Leatherbound', 'Paperback', 'Mass market pa
                        'Board book', 'Spiral-bound', 'Library binding', 'Ebook', 'Audiobook']
 
 function FormatCell({book, onChanged, onError}){
+  const readOnly = useReadOnly()
   const [busy,setBusy]=useState(false)
 
   const lookup = async ()=>{
@@ -509,15 +559,279 @@ function FormatCell({book, onChanged, onError}){
   return (
     <div className="format-cell">
       {book.format ? <span>{book.format}</span> : <span className="muted">No format</span>}
-      <button type="button" onClick={lookup} disabled={busy}
-              title="Fetch the binding from OpenLibrary. Google Books does not record it.">
-        {busy ? '...' : (book.format ? 'Refresh' : 'Lookup')}
-      </button>
+      {!readOnly && (
+        <button type="button" onClick={lookup} disabled={busy}
+                title="Fetch the binding from OpenLibrary. Google Books does not record it.">
+          {busy ? '...' : (book.format ? 'Refresh' : 'Lookup')}
+        </button>
+      )}
     </div>
   )
 }
 
 // --- shelves ---
+
+// The drawn bookcase, ported from the iOS app's BookshelfView so both clients
+// show the same thing. Geometry is in SVG user units; the viewBox scales it to
+// whatever room the page has.
+const ART_SLOT_W = 115
+const ART_SLOT_H = 100
+const ART_INSET = 14
+const ART_BOARD = 6
+const ART_DIVIDER = 4
+// How far the located slot lifts out of the row, as if pulled off the shelf.
+const ART_LIFT = 11
+
+function shelfArtGeometry(shelf){
+  const columns = Math.max(shelf.columns || 1, 1)
+  const rows = Math.max(shelf.rows || 1, 1)
+  const innerW = columns * ART_SLOT_W
+  const innerH = rows * ART_SLOT_H
+  const cell = (ci, ri)=>{
+    const x = ART_INSET + ci * ART_SLOT_W
+    const y = ART_INSET + ri * ART_SLOT_H
+    return {x, y, w: ART_SLOT_W, h: ART_SLOT_H, midX: x + ART_SLOT_W/2, midY: y + ART_SLOT_H/2, maxY: y + ART_SLOT_H}
+  }
+  return {columns, rows, innerW, innerH, width: innerW + ART_INSET*2, height: innerH + ART_INSET*2, cell}
+}
+
+// One spine standing in a slot. Books are a fixed width whatever the slot holds
+// and stack from the left upright, the way a part-filled shelf really looks, so
+// how full a cell is can be read without counting.
+function shelfArtSpine(g, ci, ri, index, capacity, heightFraction){
+  const cell = g.cell(ci, ri)
+  const usable = Math.max(cell.h - ART_BOARD, 1)
+  const height = usable * heightFraction
+  const band = Math.max(cell.w - ART_DIVIDER*2 - 4, 1)
+  const gap = capacity > 1 ? 2 : 0
+  const width = Math.max((band - gap * (capacity - 1)) / capacity, 1)
+  const start = cell.midX - band/2
+  return {x: start + index * (width + gap), y: cell.maxY - ART_BOARD - height, w: width, h: height}
+}
+
+// Stable pseudo-random, so a shelf looks the same every time it is opened.
+function shelfArtMix(a, b, salt){
+  let x = (Math.imul(a, 73856093) ^ Math.imul(b, 19349663) ^ Math.imul(salt, 83492791)) >>> 0
+  x ^= x >>> 16; x = Math.imul(x, 2246822507) >>> 0
+  x ^= x >>> 13; x = Math.imul(x, 3266489909) >>> 0
+  return (x ^ (x >>> 16)) >>> 0
+}
+
+const ART_PALETTE = ['#993333', '#335980', '#407352', '#8c6b2e', '#61427a', '#804d38', '#38475c']
+
+// Neighbouring spines are pushed apart in the palette as well as picked from it,
+// so two books side by side never come out the same colour and merge together.
+function shelfArtSpineColor(column, row, index){
+  const base = shelfArtMix(column, row, 7) % ART_PALETTE.length
+  const step = 1 + shelfArtMix(column, row, 23) % (ART_PALETTE.length - 1)
+  return ART_PALETTE[(base + step * index) % ART_PALETTE.length]
+}
+
+function shelfArtHeightFraction(column, row, index){
+  return 0.62 + (shelfArtMix(column, row * 31 + index, 11) % 30) / 100
+}
+
+// The backdrop in every slot shares one height, so it reads as a single quiet
+// band behind the books rather than as varied books of its own.
+const ART_EMPTY_HEIGHT = 0.91
+
+// How many spines still read as books rather than slivers, given how wide the
+// shelf is. A 20 column shelf on a phone gets one apiece.
+function shelfArtCapacity(columns){
+  if(columns <= 8) return 3
+  if(columns <= 14) return 2
+  return 1
+}
+
+function usePrefersReducedMotion(){
+  const [reduced,setReduced] = useState(()=>
+    typeof window !== 'undefined' && window.matchMedia
+      ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      : false)
+  useEffect(()=>{
+    if(!window.matchMedia) return
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)')
+    const onChange = ()=> setReduced(mq.matches)
+    mq.addEventListener('change', onChange)
+    return ()=> mq.removeEventListener('change', onChange)
+  }, [])
+  return reduced
+}
+
+/// A drawn bookshelf with the locating animation: crosshairs sweep to the slot,
+/// the rest of the case dims, and the book lifts and pulses while the view
+/// pushes in on it.
+function BookshelfGraphic({shelf, slots, highlight, runId}){
+  const reduced = usePrefersReducedMotion()
+  // 0 nothing yet, 1 crosshairs sweeping, 2 landed on the slot, 3 pulsing.
+  const [phase,setPhase] = useState(0)
+
+  const hasTarget = !!(highlight && highlight.column && highlight.row)
+
+  useEffect(()=>{
+    if(!hasTarget){ setPhase(0); return }
+    if(reduced){ setPhase(2); return }  // land on the answer without the sweep
+    setPhase(0)
+    const timers = [
+      setTimeout(()=> setPhase(1), 250),
+      setTimeout(()=> setPhase(2), 900),
+      setTimeout(()=> setPhase(3), 1450),
+    ]
+    return ()=> timers.forEach(clearTimeout)
+  }, [runId, hasTarget, reduced, highlight && highlight.column, highlight && highlight.row])
+
+  if(!shelf) return null
+  const g = shelfArtGeometry(shelf)
+  const sweeping = phase >= 1
+  const landed = phase >= 2
+  const pulsing = phase >= 3 && !reduced
+
+  const occupied = {}
+  ;(slots || []).forEach(s=>{
+    const key = `${s.column},${s.row}`
+    ;(occupied[key] = occupied[key] || []).push(s)
+  })
+
+  const targetCi = hasTarget ? highlight.column - 1 : -1
+  const targetRi = hasTarget ? highlight.row - 1 : -1
+  const target = hasTarget ? g.cell(targetCi, targetRi) : null
+  const capacity = shelfArtCapacity(g.columns)
+
+  // Push in on the located slot. Done as an explicit translate+scale rather
+  // than a transform-origin, which browsers place differently inside SVG.
+  const zoom = (landed && target && !reduced) ? 1.18 : 1
+  const tx = target ? target.midX - zoom * target.midX : 0
+  const ty = target ? target.midY - zoom * target.midY : 0
+  const stageStyle = {transform: `translate(${tx}px, ${ty}px) scale(${zoom})`,
+                      transition: 'transform .75s cubic-bezier(.2,.7,.3,1)'}
+
+  // Crosshairs grow from the top left to the slot. y' = INSET + p(y - INSET),
+  // written as a translate so no transform-origin is needed.
+  const p = sweeping ? 1 : 0
+  const guideV = {transform: `translate(0px, ${ART_INSET * (1 - p)}px) scale(1, ${p})`,
+                  transition: 'transform .65s ease-out'}
+  const guideH = {transform: `translate(${ART_INSET * (1 - p)}px, 0px) scale(${p}, 1)`,
+                  transition: 'transform .65s ease-out'}
+
+  const slotCells = []
+  for(let ri = 0; ri < g.rows; ri++){
+    for(let ci = 0; ci < g.columns; ci++){
+      const cell = g.cell(ci, ri)
+      const isTarget = ci === targetCi && ri === targetRi
+      const here = occupied[`${ci+1},${ri+1}`] || []
+      const drawn = Math.min(here.length, capacity)
+      const backdrop = shelfArtSpine(g, ci, ri, 0, 1, ART_EMPTY_HEIGHT)
+      const spines = []
+      for(let i = 0; i < drawn; i++){
+        spines.push({...shelfArtSpine(g, ci, ri, i, capacity, shelfArtHeightFraction(ci, ri, i)),
+                     color: shelfArtSpineColor(ci, ri, i), key: i})
+      }
+      // Everything but the located slot fades back, so the answer is the only
+      // thing left bright.
+      const dim = hasTarget && landed && !isTarget
+      const body = (
+        <g className={dim ? 'shelf-art-slot dim' : 'shelf-art-slot'} key={`${ci},${ri}`}>
+          <rect x={backdrop.x} y={backdrop.y} width={backdrop.w} height={backdrop.h} rx="3"
+                fill="url(#shelfArtEmpty)" stroke="rgba(0,0,0,.12)" strokeWidth="0.5" />
+          {isTarget ? (
+            // Centred so the lift and the pulse can be plain transforms.
+            <g transform={`translate(${cell.midX} ${cell.midY})`}>
+              <g style={{transform: landed ? `translateY(${-ART_LIFT}px)` : 'none',
+                         transition: 'transform .45s cubic-bezier(.2,1.3,.4,1)'}}>
+                <g className={pulsing ? 'shelf-art-pulse' : ''}>
+                  {spines.map(s=> (
+                    <rect key={s.key} x={s.x - cell.midX} y={s.y - cell.midY} width={s.w} height={s.h} rx="2"
+                          fill={s.color} stroke="#facc15" strokeWidth="2" className="shelf-art-spine lit" />
+                  ))}
+                  {drawn === 0 && (
+                    <rect x={backdrop.x - cell.midX} y={backdrop.y - cell.midY}
+                          width={backdrop.w} height={backdrop.h} rx="3"
+                          fill="rgba(250,204,21,.18)" stroke="#facc15" strokeWidth="2" />
+                  )}
+                </g>
+              </g>
+            </g>
+          ) : spines.map(s=> (
+            <rect key={s.key} x={s.x} y={s.y} width={s.w} height={s.h} rx="2"
+                  fill={s.color} stroke="rgba(0,0,0,.25)" strokeWidth="0.5" className="shelf-art-spine" />
+          ))}
+        </g>
+      )
+      slotCells.push(body)
+    }
+  }
+
+  const label = hasTarget
+    ? `Bookshelf ${shelf.name}. The book is at column ${highlight.column}, row ${highlight.row}.`
+    : `Bookshelf ${shelf.name}`
+
+  return (
+    <svg className="shelf-art" viewBox={`0 0 ${g.width} ${g.height}`} role="img" aria-label={label}>
+      <defs>
+        <linearGradient id="shelfArtBack" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#2e211a" />
+          <stop offset="100%" stopColor="#241a14" />
+        </linearGradient>
+        <linearGradient id="shelfArtBoard" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#5c3d29" />
+          <stop offset="100%" stopColor="#3d2619" />
+        </linearGradient>
+        <linearGradient id="shelfArtUpright" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor="#5c3d29" />
+          <stop offset="100%" stopColor="#3d2619" />
+        </linearGradient>
+        <linearGradient id="shelfArtEmpty" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor="rgba(255,255,255,.07)" />
+          <stop offset="100%" stopColor="rgba(255,255,255,.03)" />
+        </linearGradient>
+      </defs>
+
+      <g style={stageStyle}>
+        <rect x="1" y="1" width={g.width - 2} height={g.height - 2} rx="10"
+              fill="url(#shelfArtBack)" stroke="#3d2619" strokeWidth="10" />
+
+        {/* Uprights first: the sides run the height, the boards sit between them. */}
+        {Array.from({length: g.columns - 1}, (_, i)=> (
+          <rect key={`d${i}`} x={ART_INSET + (i+1) * ART_SLOT_W - ART_DIVIDER/2} y={ART_INSET}
+                width={ART_DIVIDER} height={g.innerH} fill="url(#shelfArtUpright)" />
+        ))}
+        {Array.from({length: g.rows}, (_, i)=> (
+          <rect key={`b${i}`} x={ART_INSET} y={ART_INSET + (i+1) * ART_SLOT_H - ART_BOARD}
+                width={g.innerW} height={ART_BOARD} fill="url(#shelfArtBoard)" />
+        ))}
+
+        {slotCells}
+
+        {hasTarget && (
+          <>
+            <rect x={target.midX - 1} y={ART_INSET} width="2" height={g.innerH}
+                  fill="rgba(250,204,21,.55)" style={guideV} />
+            <rect x={ART_INSET} y={target.midY - 1} width={g.innerW} height="2"
+                  fill="rgba(250,204,21,.55)" style={guideH} />
+            <g transform={`translate(${target.midX} ${target.midY})`}
+               style={{opacity: landed ? 1 : 0, transition: 'opacity .35s ease-out'}}>
+              <g className={pulsing ? 'shelf-art-pulse' : ''}>
+                <rect x={-target.w * 0.46} y={-target.h * 0.46} width={target.w * 0.92} height={target.h * 0.92}
+                      rx="5" fill="none" stroke="#facc15" strokeWidth="2.5" />
+              </g>
+              {/* The top row has no shelf above it to hang a pointer in, so its
+                  arrow points up from below instead of off the top edge.
+                  Placement is a transform attribute on an outer group: a CSS
+                  animation sets the transform property, which would otherwise
+                  replace the attribute and drop the arrow into the slot. */}
+              <g transform={`translate(0 ${targetRi > 0 ? -target.h * 0.62 : target.h * 0.62})`}>
+                <g className={pulsing ? 'shelf-art-arrow' : ''}>
+                  <path d="M -13 -10 L 13 -10 L 0 10 Z" fill="#facc15"
+                        transform={targetRi > 0 ? undefined : 'rotate(180)'} />
+                </g>
+              </g>
+            </g>
+          </>
+        )}
+      </g>
+    </svg>
+  )
+}
 
 /// A clickable shelf. Used for placing a book, and for showing where one lives.
 /// Pass onDropBook to accept books dragged onto a slot.
@@ -568,6 +882,102 @@ function ShelfGrid({shelf, slots, selected, onSelect, highlight, excludeBookId, 
   return (
     <div className="shelf-grid" style={{gridTemplateColumns:`repeat(${shelf.columns},minmax(0,1fr))`}}>
       {cells}
+    </div>
+  )
+}
+
+/// Shows where a book sits, with the locating animation. Read-only, so guests
+/// get it too.
+function ShelfLocator({book, shelves, onClose}){
+  const [layout,setLayout] = useState(null)
+  const [error,setError] = useState(null)
+  const [loading,setLoading] = useState(true)
+  // Bumped to replay the animation.
+  const [runId,setRunId] = useState(0)
+
+  const placed = !!(book.shelf_id && book.shelf_column && book.shelf_row)
+  const location = placed ? {column: book.shelf_column, row: book.shelf_row} : null
+
+  useEffect(()=>{
+    let cancelled = false
+    if(!placed){ setLoading(false); return }
+    ;(async ()=>{
+      try{
+        const res = await fetch(`${API_BASE}/shelves/${book.shelf_id}/layout`, {headers: authHeaders()})
+        if(cancelled) return
+        if(!res.ok){ setError(await readError(res)) }
+        else setLayout(await res.json())
+      }catch(err){ if(!cancelled) setError(friendlyMessage(err.message)) }
+      finally{ if(!cancelled) setLoading(false) }
+    })()
+    return ()=>{ cancelled = true }
+  }, [book.id, book.shelf_id])
+
+  // Falling back to the shelf list keeps the drawing possible when only the
+  // layout call failed.
+  const shelf = (layout && layout.shelf) || (shelves || []).find(s=> s.id === book.shelf_id)
+
+  useEffect(()=>{
+    const onKey = (e)=>{ if(e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return ()=> window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal locator" onClick={e=> e.stopPropagation()}>
+        <div className="locator-head">
+          <div style={{minWidth:0}}>
+            <h3 style={{margin:0}}>Find on shelf</h3>
+            <div className="locator-title">{book.title}</div>
+            {shelf && <div className="locator-shelf">{shelf.name}</div>}
+          </div>
+          <button type="button" onClick={onClose}>Done</button>
+        </div>
+
+        {error && <div className="alert" style={{marginTop:10}}>{error}</div>}
+
+        {!placed ? (
+          <div className="locator-empty">
+            <div className="locator-empty-icon">?</div>
+            <strong>No location yet</strong>
+            <span>Nobody has recorded where “{book.title}” lives. Use Place to set a shelf and slot.</span>
+          </div>
+        ) : loading ? (
+          <div className="locator-empty"><span>Loading the shelf...</span></div>
+        ) : !shelf ? (
+          // The book does have a position; we just could not fetch the shelf to
+          // draw it. Saying "no location" here would be a lie.
+          <div className="locator-empty">
+            <div className="locator-empty-icon">!</div>
+            <strong>Couldn't load the shelf</strong>
+            <span>“{book.title}” is at column {book.shelf_column}, row {book.shelf_row}, but the shelf could not be fetched.</span>
+          </div>
+        ) : (
+          <>
+            <div className="shelf-frame locator-frame">
+              <BookshelfGraphic shelf={shelf} slots={layout && layout.slots}
+                                highlight={location} runId={runId} />
+            </div>
+            <div className="locator-coords">
+              <div className="locator-coord">
+                <span>COLUMN</span>
+                <strong>{book.shelf_column}</strong>
+                <span>of {shelf.columns}</span>
+              </div>
+              <div className="locator-coord-divider" />
+              <div className="locator-coord">
+                <span>ROW</span>
+                <strong>{book.shelf_row}</strong>
+                <span>of {shelf.rows}</span>
+              </div>
+              <button type="button" style={{marginLeft:'auto'}} onClick={()=> setRunId(v=> v+1)}>
+                Play again
+              </button>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   )
 }
@@ -684,6 +1094,7 @@ function CoverThumb({book, width=34}){
 
 /// Browse a shelf: see it drawn, click a slot to see what is in it.
 function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
+  const readOnly = useReadOnly()
   const [shelfId,setShelfId] = useState(shelves[0] ? shelves[0].id : null)
   const [books,setBooks] = useState([])
   const [selected,setSelected] = useState(null)
@@ -752,7 +1163,7 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
 
   if(!shelves.length){
     return <div className="card"><h3>Bookshelf</h3>
-      <div style={{color:'#666'}}>No shelves yet — add one below to get started.</div></div>
+      <div style={{color:'#666'}}>{readOnly ? 'No shelves have been set up yet.' : 'No shelves yet — add one below to get started.'}</div></div>
   }
 
   return (
@@ -788,7 +1199,7 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
           <ShelfGrid shelf={shelf} slots={slots}
                      selected={selected}
                      onSelect={(c,r)=> setSelected({column:c, row:r})}
-                     onDropBook={moveBook}
+                     onDropBook={readOnly ? undefined : moveBook}
                      dragActive={!!dragging} />
         </div>
 
@@ -801,7 +1212,7 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
                 <strong>Column {selected.column}, row {selected.row}</strong>
                 <span>{inSlot.length? `${inSlot.length} book${inSlot.length===1?'':'s'}` : 'Empty'}</span>
               </div>
-              {inSlot.length>0 && (
+              {inSlot.length>0 && !readOnly && (
                 <div className="drag-hint">
                   Drag a book onto a slot to move it{shelves.length>1 ? ', or onto a shelf name to move it there' : ''}.
                 </div>
@@ -810,14 +1221,15 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
               {inSlot.map(b=> (
                 <div key={b.id}
                      className={dragging===b.id ? 'slot-book dragging' : 'slot-book'}
-                     draggable
+                     draggable={!readOnly}
                      onDragStart={e=>{
+                       if(readOnly){ e.preventDefault(); return }
                        e.dataTransfer.setData('text/plain', String(b.id))
                        e.dataTransfer.effectAllowed = 'move'
                        setDragging(b.id)
                      }}
                      onDragEnd={()=> setDragging(null)}>
-                  <span className="drag-handle" title="Drag onto a slot to move this book">⠿</span>
+                  {!readOnly && <span className="drag-handle" title="Drag onto a slot to move this book">⠿</span>}
                   <CoverThumb book={b} width={34} />
                   <div style={{minWidth:0,flex:1}}>
                     <div className="slot-book-title">{b.title}</div>
@@ -826,10 +1238,12 @@ function BookshelfBrowser({shelves, refreshToken, onPlace, onDelete, onMoved}){
                       <div className="slot-book-tags">{b.tags.slice(0,3).join(' · ')}</div>
                     )}
                   </div>
-                  <div className="nowrap">
-                    <button type="button" onClick={()=> onPlace(b)}>Move</button>
-                    <button type="button" onClick={()=> onDelete(b)} style={{marginLeft:6}}>Delete</button>
-                  </div>
+                  {!readOnly && (
+                    <div className="nowrap">
+                      <button type="button" onClick={()=> onPlace(b)}>Move</button>
+                      <button type="button" onClick={()=> onDelete(b)} style={{marginLeft:6}}>Delete</button>
+                    </div>
+                  )}
                 </div>
               ))}
             </>
@@ -981,25 +1395,53 @@ function ShelfPreview({shelfId}){
 /// The location cell in the books table: shows where a book is, and opens the
 /// picker. Editing happens in the modal rather than inline, because a position
 /// is three linked values and a free-text cell cannot validate them.
-function LocationCell({book, shelves, onPlace}){
+function LocationCell({book, shelves, onPlace, onLocate}){
+  const readOnly = useReadOnly()
   const shelf = (shelves || []).find(s=> s.id === book.shelf_id)
   const placed = book.shelf_id && book.shelf_column && book.shelf_row
-  return (
-    <button type="button" className={placed? 'location-btn placed' : 'location-btn'}
-            onClick={()=> onPlace(book)}
-            title={placed? `${shelf? shelf.name : 'Shelf'} — column ${book.shelf_column}, row ${book.shelf_row}`
-                         : 'Set where this book lives'}>
-      {placed
-        ? <>
-            <span className="location-shelf">{shelf? shelf.name : 'Shelf'}</span>
-            <span className="location-coord">{book.shelf_column},{book.shelf_row}</span>
-          </>
-        : <span className="location-empty">Place</span>}
+  const where = placed
+    ? `${shelf? shelf.name : 'Shelf'} — column ${book.shelf_column}, row ${book.shelf_row}`
+    : 'Not placed on a shelf'
+  const locate = (placed && onLocate) ? (
+    <button type="button" className="locate-btn" onClick={()=> onLocate(book)}
+            title={`Show where “${book.title}” is on the shelf`}>
+      ◎ Locate
     </button>
+  ) : null
+  if(readOnly){
+    return (
+      <div className="location-cell">
+        <span className={placed? 'location-btn placed' : 'location-btn'} title={where}>
+          {placed
+            ? <>
+                <span className="location-shelf">{shelf? shelf.name : 'Shelf'}</span>
+                <span className="location-coord">{book.shelf_column},{book.shelf_row}</span>
+              </>
+            : <span className="location-empty muted">Not placed</span>}
+        </span>
+        {locate}
+      </div>
+    )
+  }
+  return (
+    <div className="location-cell">
+      <button type="button" className={placed? 'location-btn placed' : 'location-btn'}
+              onClick={()=> onPlace(book)}
+              title={placed? where : 'Set where this book lives'}>
+        {placed
+          ? <>
+              <span className="location-shelf">{shelf? shelf.name : 'Shelf'}</span>
+              <span className="location-coord">{book.shelf_column},{book.shelf_row}</span>
+            </>
+          : <span className="location-empty">Place</span>}
+      </button>
+      {locate}
+    </div>
   )
 }
 
 function SourcesCell({book, onChanged, onError}){
+  const readOnly = useReadOnly()
   const [busy,setBusy]=useState(null)
 
   const lookup = async (kind)=>{
@@ -1018,6 +1460,7 @@ function SourcesCell({book, onChanged, onError}){
         <span className="source-label">OL</span>
         {book.olid
           ? <a className="source-link" href={`https://openlibrary.org/books/${book.olid}`} target="_blank" rel="noreferrer" title={book.olid}>{book.olid}</a>
+          : readOnly ? <span className="muted">—</span>
           : <button type="button" onClick={()=>lookup('olid')} disabled={!!busy || !book.isbn}
                     title={book.isbn ? 'Look up the OpenLibrary edition id from the ISBN' : 'Add an ISBN first'}>
               {busy==='olid' ? '...' : 'Lookup'}
@@ -1027,6 +1470,7 @@ function SourcesCell({book, onChanged, onError}){
         <span className="source-label">GB</span>
         {book.google_id
           ? <a className="source-link" href={`https://books.google.com/books?id=${book.google_id}`} target="_blank" rel="noreferrer" title={book.google_id}>{book.google_id}</a>
+          : readOnly ? <span className="muted">—</span>
           : <button type="button" onClick={()=>lookup('google')} disabled={!!busy || (!book.isbn && !book.title)}
                     title="Look up the Google Books volume id">
               {busy==='google' ? '...' : 'Lookup'}
@@ -1049,7 +1493,8 @@ function SortHeader({label, field, sort, onSort}){
   )
 }
 
-function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace}){
+function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate}){
+  const readOnly = useReadOnly()
   const [editingId, setEditingId] = useState(null)
   const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', added:'', addedOriginal:''})
   // Which row the message belongs to, not just the message: an error printed
@@ -1117,7 +1562,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
           <th>Format</th>
           <th className="col-notes">Notes</th>
           <SortHeader label="Added" field="added" sort={sort} onSort={onSort} />
-          <th></th>
+          {!readOnly && <th></th>}
         </tr></thead>
         <tbody>
           {books.map(b=> (
@@ -1133,7 +1578,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                     <input value={editVals.olid} placeholder="OL12345M" onChange={e=>setEditVals({...editVals, olid: e.target.value})} />
                     <input style={{marginTop:4}} value={editVals.googleId} placeholder="otCEEQAAQBAJ" onChange={e=>setEditVals({...editVals, googleId: e.target.value})} />
                   </td>
-                  <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
+                  <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} onLocate={onLocate} /></td>
                   <td><input value={editVals.tags} placeholder="comma, separated, tags" onChange={e=>setEditVals({...editVals, tags: e.target.value})} /></td>
                   <td>
                     <input list="known-formats" value={editVals.format} placeholder="Paperback"
@@ -1152,21 +1597,23 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   <td className="col-author">{b.author}</td>
                   <td className="col-isbn nowrap">{b.isbn}</td>
                   <td><SourcesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
-                  <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} /></td>
+                  <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} onLocate={onLocate} /></td>
                   <td><TagsCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="nowrap"><FormatCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="col-notes">{b.notes}</td>
                   <td className="nowrap">{formatAdded(b.created_at)}</td>
-                  <td className="nowrap">
-                    <button onClick={()=>startEdit(b)}>Edit</button>
-                    <button onClick={()=>onDelete(b)} style={{marginLeft:6}}>Delete</button>
-                  </td>
+                  {!readOnly && (
+                    <td className="nowrap">
+                      <button onClick={()=>startEdit(b)}>Edit</button>
+                      <button onClick={()=>onDelete(b)} style={{marginLeft:6}}>Delete</button>
+                    </td>
+                  )}
                 </>
               )}
             </tr>
             {rowError && rowError.bookId===b.id && (
               <tr className="row-error">
-                <td colSpan={11}><div className="alert">{rowError.message}</div></td>
+                <td colSpan={readOnly ? 10 : 11}><div className="alert">{rowError.message}</div></td>
               </tr>
             )}
             </Fragment>
@@ -1183,6 +1630,9 @@ export default function App(){
   const [recent,setRecent]=useState([])
   const [q,setQ]=useState('')
   const [loggedIn,setLoggedIn]=useState(!!localStorage.getItem('token'))
+  // null until /me answers. Assuming either way would flash the wrong UI.
+  const [me,setMe]=useState(null)
+  const [meError,setMeError]=useState(null)
   const [undo,setUndo]=useState(null)
   const [undoTimer,setUndoTimer]=useState(null)
   const [sort,setSort]=useState({field:'added', dir:'desc'})
@@ -1195,8 +1645,12 @@ export default function App(){
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
   const [placing,setPlacing]=useState(null)
+  // The book whose shelf position is being shown. Read-only, so guests get it.
+  const [locating,setLocating]=useState(null)
   // Bumped whenever a location changes, so the bookshelf browser refetches.
   const [locationVersion,setLocationVersion]=useState(0)
+
+  const readOnly = !!(me && me.read_only)
 
   const sortNewestFirst = (list)=> Array.isArray(list) ? [...list].sort((a,b)=> (b.id||0)-(a.id||0)) : []
 
@@ -1287,6 +1741,35 @@ export default function App(){
     fetchTags()
   }
 
+  const loadMe = async ()=>{
+    setMeError(null)
+    try{
+      const res = await fetch(API_BASE + '/me', {headers: authHeaders()})
+      if(res.ok){ setMe(await res.json()); return }
+      if(res.status===401){ localStorage.removeItem('token'); setLoggedIn(false); return }
+      if(res.status===404){
+        // A backend older than guest access has no /me and no guests either, so
+        // an authenticated session there can only be a full account. Treating
+        // this as read-only would lock everyone out of their own library.
+        setMe({username: null, role: 'admin', read_only: false})
+        return
+      }
+      setMeError('Could not reach the server. Your session is still signed in.')
+    }catch(err){
+      setMeError('Could not reach the server. Your session is still signed in.')
+    }
+  }
+
+  useEffect(()=>{
+    if(!loggedIn){ setMe(null); setMeError(null); return }
+    loadMe()
+  }, [loggedIn])
+
+  // Guests have no Add tab, so send them somewhere that exists.
+  useEffect(()=>{
+    if(readOnly && tab==='add'){ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() }
+  }, [readOnly])
+
   useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() } }, [loggedIn])
 
   const setUndoWithTimeout = (u)=>{
@@ -1365,16 +1848,18 @@ export default function App(){
     fetchFormats()
   }
 
-  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setFormatFilter(''); setFormatsInUse([]) }
+  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setFormatFilter(''); setFormatsInUse([]) }
 
   return (
+    <ReadOnlyContext.Provider value={readOnly}>
     <div className={loggedIn ? 'container wide' : 'container'}>
       <datalist id="known-formats">
         {KNOWN_FORMATS.map(f=> <option key={f} value={f} />)}
       </datalist>
       <div className="header">
         <h1>Book Library</h1>
-        {loggedIn && <button onClick={logout}>Logout</button>}
+        {readOnly && <span className="guest-badge" title="Guests can view and search, but not change the library">Guest — read only</span>}
+        {loggedIn && <button onClick={logout}>{readOnly ? 'Leave' : 'Logout'}</button>}
       </div>
 
       {undo && (
@@ -1384,16 +1869,31 @@ export default function App(){
         </div>
       )}
 
-      {!loggedIn ? <Login onLogin={()=>setLoggedIn(true)} /> : (
+      {!loggedIn ? <Login onLogin={()=>setLoggedIn(true)} /> : !me ? (
+        // Until /me answers we do not know whether this is a guest, and drawing
+        // the editor first would offer buttons that answer 403.
+        <div className="card">
+          {meError ? (
+            <>
+              <div className="alert">{meError}</div>
+              <button type="button" onClick={loadMe}>Try again</button>
+              <button type="button" onClick={logout} style={{marginLeft:6}}>Sign out</button>
+            </>
+          ) : <div style={{color:'#666'}}>Loading...</div>}
+        </div>
+      ) : (
         <>
           {placing && (
             <ShelfPicker book={placing} shelves={shelves}
                          onClose={()=> setPlacing(null)}
                          onSaved={(updated)=>{ onBookPatched(updated); fetchShelves(); setLocationVersion(v=> v+1) }} />
           )}
+          {locating && (
+            <ShelfLocator book={locating} shelves={shelves} onClose={()=> setLocating(null)} />
+          )}
           <div className="tabs">
-            <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>
-            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() }}>Manage</button>
+            {!readOnly && <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>}
+            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() }}>{readOnly ? 'Browse' : 'Manage'}</button>
             <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>
           </div>
 
@@ -1402,19 +1902,19 @@ export default function App(){
               <BookshelfBrowser shelves={shelves} refreshToken={locationVersion}
                                 onPlace={setPlacing} onDelete={handleDelete}
                                 onMoved={(updated)=>{ onBookPatched(updated); fetchShelves() }} />
-              <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks(); setLocationVersion(v=> v+1) }} />
+              {!readOnly && <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks(); setLocationVersion(v=> v+1) }} />}
             </>
-          ) : tab==='add' ? (
+          ) : (tab==='add' && !readOnly) ? (
             <>
               <AddForm onAdded={onAdded} />
               <div className="card" style={{minWidth:0}}>
                 <h3>Recently added this session</h3>
-                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
+                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
               </div>
             </>
           ) : (
             <div className="card" style={{minWidth:0}}>
-              <h3>Manage library</h3>
+              <h3>{readOnly ? 'Browse library' : 'Manage library'}</h3>
               <form className="search-row" onSubmit={e=>{ e.preventDefault(); fetchBooks() }}>
                 <input placeholder="Search title, author, notes or ISBN" value={q} onChange={e=>setQ(e.target.value)} />
                 <button type="submit">Search</button>
@@ -1428,13 +1928,14 @@ export default function App(){
               </form>
               <TagFilter tags={allTags} selected={selectedTags} match={tagMatch}
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}
-                         onRefreshAll={books.length ? refreshAllTags : null} refreshing={refreshing} />
+                         onRefreshAll={(books.length && !readOnly) ? refreshAllTags : null} refreshing={refreshing} />
               <div style={{margin:'8px 0',color:'#666',fontSize:13}}>{books.length} book{books.length===1?'':'s'}</div>
-              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} emptyText="No books match." />
+              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} emptyText="No books match." />
             </div>
           )}
         </>
       )}
     </div>
+    </ReadOnlyContext.Provider>
   )
 }

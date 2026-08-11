@@ -74,6 +74,8 @@ All settings live in `.env` (never committed — see `.env.example`).
 | ---------------- | -------------------------------------------------------------- |
 | `SECRET_KEY`     | Signs JWT access tokens. **Generate your own.**                 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default `480`, i.e. 8 hours)       |
+| `GUEST_ACCESS_ENABLED` | Set to `false` to remove the read-only guest login (default `true`) |
+| `GUEST_TOKEN_EXPIRE_MINUTES` | Guest session lifetime (default `120`)             |
 | `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
 | `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
 | `DEFAULT_SHELF_COLUMNS` / `DEFAULT_SHELF_ROWS` | Size of the shelf seeded on a new database (default `6` / `8`) |
@@ -112,6 +114,32 @@ Once you have a fixed public origin, tighten CORS in
 The library lives in a SQLite file at `backend/books.db`, bind mounted from the
 host so it survives rebuilds. It is gitignored. Back it up by copying the file.
 
+**The database sits inside the folder you deploy.** A plain "copy everything to
+the server" therefore overwrites the live library with whatever `books.db` is on
+your machine — and the same goes for `.env`. Use `deploy.ps1` rather than a raw
+copy:
+
+```powershell
+.\deploy.ps1 -Destination \\bookserver\srv\booklib -DryRun   # see what would move
+.\deploy.ps1 -Destination \\bookserver\srv\booklib           # copy the source
+.\deploy.ps1 -Destination \\bookserver\srv\booklib -Mirror   # also purge removed files
+```
+
+It excludes `books.db` (and its journal/WAL files), `.env`, `node_modules`,
+`dist`, `__pycache__` and `.git`. Excluded files are never copied *and never
+deleted*, so `-Mirror` cannot take out the live database. Both images build from
+source on the server, so the build artefacts do not need to travel.
+
+After copying, restart the stack so the backend reopens the database:
+
+```bash
+docker compose up -d --build
+```
+
+Restoring a backup needs the same restart — SQLite holds the old file handle
+open, so a file swapped underneath a running container is ignored until it
+restarts.
+
 If the API returns `attempt to write a readonly database`, the file or its
 directory is not writable by the container user:
 
@@ -128,13 +156,20 @@ Rows whose ISBN already exists are skipped.
 
 ## API
 
-All routes except `/health` and `/token` require an
+All routes except `/health`, `/auth/config`, `/token` and `/token/guest` require an
 `Authorization: Bearer <token>` header.
+
+Tokens carry a role. Accounts made with `create_user.py` get `admin` and may do
+anything; a token from `/token/guest` gets `guest` and is read-only — every
+`POST`, `PUT` and `DELETE` below answers `403 Guest accounts are read-only`.
 
 | Method   | Path              | Description                              |
 | -------- | ----------------- | ---------------------------------------- |
 | `GET`    | `/health`         | Liveness check                           |
 | `POST`   | `/token`          | Exchange username/password for a JWT     |
+| `POST`   | `/token/guest`    | Get a read-only guest JWT, no credentials |
+| `GET`    | `/auth/config`    | Whether guest access is enabled          |
+| `GET`    | `/me`             | Caller's username, role and `read_only` flag |
 | `GET`    | `/books`          | List books, optional `?q=` search (title, author, ISBN, OLID, notes) + `?sort=`/`?dir=` + `?tags=`/`?match=` + `?format=`/`?has_format=` |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
@@ -377,4 +412,7 @@ VITE_API_BASE=http://localhost:8882 npm run dev
 - `.env` and `backend/books.db` are gitignored — keep it that way.
 - Back up `SECRET_KEY`; changing it invalidates every issued token.
 - There is no public registration; users are created with `create_user.py`.
+- The guest login is read-only and needs no password, so anyone who can reach the
+  app can read the whole library. Set `GUEST_ACCESS_ENABLED=false` if that is not
+  what you want.
 - Put the app behind HTTPS before exposing it to the internet.
