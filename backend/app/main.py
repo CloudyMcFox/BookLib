@@ -157,8 +157,97 @@ def clean_google_id(value: Optional[str]) -> Optional[str]:
     return v if re.fullmatch(r'[A-Za-z0-9_-]{8,40}', v) else None
 
 
-TIMESTAMP_FORMATS = ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d')
+# Series names arrive with the volume number attached in half a dozen shapes:
+# "The Wheel of Time ; 1" from OpenLibrary, "Discworld, #5" from a title, and
+# "Book Three of the Stormlight Archive" from a subtitle. Split rather than
+# store the lot, so the number can be sorted on.
+MAX_SERIES_LENGTH = 120
+MAX_DESCRIPTION_LENGTH = 8000
 
+
+def clean_series(value: Optional[str]) -> Optional[str]:
+    """Tidy a series name: collapse whitespace, drop a trailing 'series' or a
+    dangling separator, and cap the length so a stray paragraph cannot be parked
+    in the column."""
+    v = clean(value)
+    if not v:
+        return None
+    v = re.sub(r'\s+', ' ', v).strip(' ,;:-')
+    v = re.sub(r'\s+series$', '', v, flags=re.IGNORECASE).strip(' ,;:-')
+    # "the Wheel of Time" and "The Wheel of Time" are one series, and which one
+    # is stored depends only on where the sentence it was read out of started.
+    v = re.sub(r'^the\s+', 'The ', v, flags=re.IGNORECASE)
+    return v[:MAX_SERIES_LENGTH] or None
+
+
+def clean_series_index(value) -> Optional[float]:
+    """A series position as a number. Accepts '3', '3.5' or 'Book 3'; anything
+    without a number in it, and anything negative, is no position at all."""
+    if value is None or value == '':
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        m = re.search(r'\d+(?:\.\d+)?', str(value))
+        if not m:
+            return None
+        number = float(m.group(0))
+    if number < 0 or number > 10000:
+        return None
+    # Whole numbers stay whole, so 3.0 is stored and shown as 3.
+    return round(number, 2)
+
+
+def split_series(value: Optional[str]) -> tuple:
+    """Split a combined series string into (name, index).
+
+    OpenLibrary packs alternate namings of the same series into one field
+    separated by semicolons ("Dune (1); Dune Chronicles"), so each is tried in
+    turn and the first that yields a number wins. A string with no number in it
+    is a series name and nothing more."""
+    v = clean(value)
+    if not v:
+        return (None, None)
+    v = re.sub(r'\s+', ' ', v)
+    segments = [v] + [s for s in v.split(';') if s.strip()]
+    for segment in segments:
+        name, index = _series_from_text(segment)
+        if name and index is not None:
+            return (name, index)
+    # No number anywhere: keep the name, dropping a trailing "(1)" that the
+    # patterns above declined only because the name beside it was too short.
+    first = re.sub(r'\s*\(\s*\d+(?:\.\d+)?\s*\)\s*$', '', v.split(';')[0])
+    return (clean_series(first), None)
+
+
+def clean_description(value: Optional[str]) -> Optional[str]:
+    """Descriptions come as HTML from Google Books and as Markdown-ish text from
+    OpenLibrary. Store readable plain text: no tags, no runaway blank lines, and
+    a length cap so one book cannot dominate every listing response."""
+    v = clean(value)
+    if not v:
+        return None
+    v = re.sub(r'<br\s*/?>|</p\s*>|</div\s*>|</li\s*>', '\n', v, flags=re.IGNORECASE)
+    v = re.sub(r'<[^>]+>', '', v)
+    v = v.replace('\r\n', '\n').replace('\r', '\n')
+    v = (v.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&quot;', '"')
+          .replace('&#39;', "'").replace('&lt;', '<').replace('&gt;', '>'))
+    # OpenLibrary appends a source line to many work descriptions.
+    v = re.split(r'\n\s*-{3,}\s*\n|\[?source\]?\s*:?\s*http', v, flags=re.IGNORECASE)[0]
+    # OpenLibrary descriptions are Markdown, which renders as literal asterisks
+    # in a plain-text cell. Only emphasis is unwrapped: links and lists read
+    # fine as they are.
+    v = re.sub(r'\*\*\*(?=\S)(.+?)(?<=\S)\*\*\*', r'\1', v, flags=re.DOTALL)
+    v = re.sub(r'\*\*(?=\S)(.+?)(?<=\S)\*\*', r'\1', v, flags=re.DOTALL)
+    v = re.sub(r'(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])', r'\1', v)
+    v = re.sub(r'[ \t]+', ' ', v)
+    v = re.sub(r'\n{3,}', '\n\n', v).strip()
+    if len(v) > MAX_DESCRIPTION_LENGTH:
+        v = v[:MAX_DESCRIPTION_LENGTH].rstrip() + '…'
+    return v or None
+
+
+TIMESTAMP_FORMATS = ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d')
 
 def clean_timestamp(value: Optional[str]) -> Optional[str]:
     """Normalise a user supplied 'date added' to the stored ISO-8601 UTC format.
@@ -189,6 +278,14 @@ class Book(BaseModel):
     # Binding: Hardcover, Paperback and so on. Free text, but written through
     # clean_format so the same binding is not spelled three ways.
     format: Optional[str] = None
+    # Series the book belongs to, and its position in it. Stored apart so a
+    # series can be sorted in reading order rather than alphabetically by a
+    # string that happens to start with a number.
+    series: Optional[str] = None
+    series_index: Optional[float] = None
+    # Publisher blurb / work summary. Long free text, fetched from Google Books
+    # or OpenLibrary.
+    description: Optional[str] = None
     notes: Optional[str] = None
     # Physical location. All three travel together: a shelf without a slot, or a
     # slot without a shelf, is not a position.
@@ -322,6 +419,13 @@ if 'shelf_row' not in _existing_cols:
 # up as one value.
 if 'format' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN format TEXT")
+# Series name and position, kept apart so "book 2" sorts before "book 10".
+if 'series' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN series TEXT")
+if 'series_index' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN series_index REAL")
+if 'description' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN description TEXT")
 conn.execute("CREATE INDEX IF NOT EXISTS idx_books_shelf ON books(shelf_id)")
 
 # Seed one shelf so the feature works out of the box rather than presenting an
@@ -333,7 +437,8 @@ if not conn.execute("SELECT 1 FROM shelves LIMIT 1").fetchone():
 conn.commit()
 
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
-BOOK_COLUMNS = "id, title, author, isbn, olid, google_id, notes, format, created_at, shelf_id, shelf_column, shelf_row, length(cover) AS cover_size"
+BOOK_COLUMNS = ("id, title, author, isbn, olid, google_id, notes, format, series, series_index, "
+                "description, created_at, shelf_id, shelf_column, shelf_row, length(cover) AS cover_size")
 
 # Whitelisted ORDER BY clauses, so the sort parameter can never be injected.
 # Books added before created_at existed sort by id, which preserves insert order.
@@ -344,6 +449,11 @@ SORT_CLAUSES = {
     # Unplaced books sort last either way, so the list does not open on a block
     # of blanks.
     'location': "CASE WHEN shelf_id IS NULL THEN 1 ELSE 0 END, shelf_id {dir}, shelf_row {dir}, shelf_column {dir}, id {dir}",
+    # Within a series, reading order beats alphabetical: the number sorts as a
+    # number, and books with no series go last either way.
+    'series': ("CASE WHEN series IS NULL OR series='' THEN 1 ELSE 0 END, series COLLATE NOCASE {dir}, "
+               "CASE WHEN series_index IS NULL THEN 1 ELSE 0 END, series_index {dir}, "
+               "title COLLATE NOCASE {dir}, id {dir}"),
 }
 DEFAULT_SORT = 'added'
 
@@ -1100,6 +1210,216 @@ def _openlibrary_genres(olid: Optional[str], isbn: Optional[str]) -> List[str]:
     return []
 
 
+def _openlibrary_edition(olid: Optional[str], isbn: Optional[str]) -> Optional[dict]:
+    """The raw OpenLibrary edition record, by edition id or ISBN."""
+    edition = clean_olid(olid)
+    cleaned = re.sub(r'[^0-9Xx]', '', isbn or '')
+    urls = ([f"{OL_BASE}/books/{edition}.json"] if edition else []) + \
+           ([f"{OL_BASE}/isbn/{cleaned}.json"] if cleaned else [])
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, dict):
+                    return data
+        except (requests.RequestException, ValueError):
+            continue
+    return None
+
+
+def _openlibrary_works(edition: Optional[dict]) -> List[dict]:
+    """The work records an edition belongs to. Works are where OpenLibrary keeps
+    the description; the edition record rarely has one."""
+    works: List[dict] = []
+    for ref in ((edition or {}).get('works') or []):
+        key = ref.get('key') if isinstance(ref, dict) else None
+        if not key:
+            continue
+        try:
+            r = requests.get(f"{OL_BASE}{key}.json", timeout=8)
+            if r.status_code == 200 and isinstance(r.json(), dict):
+                works.append(r.json())
+        except (requests.RequestException, ValueError):
+            continue
+    return works
+
+
+def _ol_text(value) -> Optional[str]:
+    """OpenLibrary text fields are either a plain string or {'type': ...,
+    'value': ...} depending on how old the record is."""
+    if isinstance(value, dict):
+        return clean(value.get('value'))
+    if isinstance(value, str):
+        return clean(value)
+    return None
+
+
+# A series is stated in prose far more often than in a structured field. The
+# shapes that actually appear on OpenLibrary and Google Books titles and
+# subtitles, most specific first:
+#   "Book Three of the Stormlight Archive"   "Volume 2 of the Sandman"
+#   "The Stormlight Archive, Book 3"         "Discworld, #5"
+#   "(The Wheel of Time, #1)"                "The Wheel of Time ; 1"
+_ORDINAL_WORDS = {
+    'one': 1, 'first': 1, 'two': 2, 'second': 2, 'three': 3, 'third': 3,
+    'four': 4, 'fourth': 4, 'five': 5, 'fifth': 5, 'six': 6, 'sixth': 6,
+    'seven': 7, 'seventh': 7, 'eight': 8, 'eighth': 8, 'nine': 9, 'ninth': 9,
+    'ten': 10, 'tenth': 10, 'eleven': 11, 'eleventh': 11, 'twelve': 12, 'twelfth': 12,
+}
+_NUMBER_WORD = r'\d+(?:\.\d+)?|' + '|'.join(_ORDINAL_WORDS)
+_VOLUME_WORD = r'book|bk\.?|volume|vol\.?|part|pt\.?|no\.?|nr\.?|#'
+
+# "Book Three of the Stormlight Archive" — the number leads, the name follows.
+_SERIES_NUMBER_FIRST = re.compile(
+    rf'^\s*(?:{_VOLUME_WORD})\s*(?P<num>{_NUMBER_WORD})\b\s+(?:of|in)\s+(?P<name>.+?)\s*$',
+    re.IGNORECASE)
+# "The Stormlight Archive, Book 3" — the name leads.
+_SERIES_NAME_FIRST = re.compile(
+    rf'^\s*(?P<name>.+?)\s*[,;:]?\s*(?:{_VOLUME_WORD})\s*(?P<num>{_NUMBER_WORD})\s*$',
+    re.IGNORECASE)
+# "The Wheel of Time ; 1" — OpenLibrary's own series field.
+_SERIES_BARE_NUMBER = re.compile(r'^\s*(?P<name>.+?)\s*[;,]\s*(?P<num>\d+(?:\.\d+)?)\s*$')
+# A trailing parenthetical, which is where publishers park the series on a title.
+_SERIES_PARENTHETICAL = re.compile(r'[\(\[]\s*(?P<body>[^()\[\]]{2,100}?)\s*[\)\]]\s*$')
+# "Dune (1)" — OpenLibrary's series field again, numbered the other way round.
+_SERIES_PAREN_NUMBER = re.compile(r'^\s*(?P<name>.+?)\s*[\(\[]\s*(?P<num>\d+(?:\.\d+)?)\s*[\)\]]\s*$')
+# Parentheticals and subtitles that are about the printing, not the series.
+_NOT_A_SERIES = re.compile(
+    r'\b(edition|ed\.|reprint|revised|illustrated|unabridged|abridged|anniversary|'
+    r'paperback|hardcover|hardback|audio|audiobook|movie tie|deluxe|boxed set|'
+    r'library|translated|complete|collection|omnibus|a novel|novel)\b', re.IGNORECASE)
+
+
+def _series_number(raw: Optional[str]) -> Optional[float]:
+    """A volume number written either way: '3', '3.5' or 'Three'."""
+    if raw is None:
+        return None
+    word = str(raw).strip().lower()
+    if word in _ORDINAL_WORDS:
+        return float(_ORDINAL_WORDS[word])
+    return clean_series_index(word)
+
+
+def _series_from_text(text: Optional[str]) -> tuple:
+    """Read a series and volume number out of one title or subtitle.
+
+    A number is required. Without one there is no telling a series apart from
+    an edition note or a tagline, and a wrong series is worse than none: it puts
+    an unrelated book in the middle of a reading order."""
+    v = clean(text)
+    if not v:
+        return (None, None)
+    v = re.sub(r'\s+', ' ', v)
+
+    bodies = [v]
+    m = _SERIES_PARENTHETICAL.search(v)
+    if m:
+        # The parenthetical is the better candidate, so it is read first.
+        bodies.insert(0, m.group('body'))
+
+    for body in bodies:
+        if not re.search(r'\d|\b(' + '|'.join(_ORDINAL_WORDS) + r')\b', body, flags=re.IGNORECASE):
+            continue
+        if _NOT_A_SERIES.search(body):
+            continue
+        for pattern in (_SERIES_NUMBER_FIRST, _SERIES_NAME_FIRST, _SERIES_BARE_NUMBER, _SERIES_PAREN_NUMBER):
+            found = pattern.match(body)
+            if not found:
+                continue
+            name = clean_series(found.group('name'))
+            index = _series_number(found.group('num'))
+            # "It 2" and "1984, part 2" are a title and a number, not a series;
+            # a one-word-or-shorter name is more likely noise than a series.
+            if name and len(name) >= 3 and index is not None:
+                return (name, index)
+    return (None, None)
+
+
+def _series_from_title(*titles) -> tuple:
+    """The first series any of these titles or subtitles states."""
+    for title in titles:
+        name, index = _series_from_text(title)
+        if name:
+            return (name, index)
+    return (None, None)
+
+
+def _fetch_series(olid: Optional[str], isbn: Optional[str], title: Optional[str] = None,
+                  google_id: Optional[str] = None) -> tuple:
+    """Find the series a book belongs to, as (name, index).
+
+    There is no reliable structured field for this on either catalogue.
+    OpenLibrary's edition records have a `series` field, which is the one place
+    it is stated outright, but it is filled in for a minority of editions;
+    Google Books publishes only an order number, never the series name. What
+    both do carry is the full title as printed, and publishers put the series in
+    the subtitle ("Book Three of the Stormlight Archive") or in a parenthetical
+    ("Words of Radiance (The Stormlight Archive, #2)"). So: the explicit field
+    first, then the titles and subtitles of the edition, its work, and Google's
+    record of it, and the stored title last."""
+    edition = _openlibrary_edition(olid, isbn)
+    for raw in ((edition or {}).get('series') or []):
+        name, index = split_series(raw if isinstance(raw, str) else None)
+        if name:
+            # An edition that names the series but not the volume can still take
+            # its number from the title.
+            if index is None:
+                index = _series_from_title(edition.get('title'), title)[1]
+            return (name, index)
+
+    # OpenLibrary titles and subtitles, then Google's, then ours.
+    candidates: List[Optional[str]] = []
+    if edition:
+        candidates.extend([edition.get('title'), edition.get('subtitle')])
+    for work in _openlibrary_works(edition):
+        candidates.extend([work.get('title'), work.get('subtitle')])
+
+    info = (_google_item_for(isbn, google_id) or {}).get('volumeInfo') or {}
+    candidates.extend([info.get('title'), info.get('subtitle')])
+    candidates.append(title)
+
+    name, index = _series_from_title(*candidates)
+    return (name, index)
+
+
+def _fetch_description(olid: Optional[str], isbn: Optional[str], title: Optional[str] = None,
+                       author: Optional[str] = None, google_id: Optional[str] = None) -> Optional[str]:
+    """Find a description for a book.
+
+    Google Books first: its `description` is the publisher blurb and is present
+    for most books in print, while OpenLibrary's is contributed by volunteers
+    and is missing far more often than not. OpenLibrary's work description is
+    the fallback, and its edition description the last resort."""
+    info = (_google_item_for(isbn, google_id) or {}).get('volumeInfo') or {}
+    found = clean_description(info.get('description'))
+    if found:
+        return found
+
+    edition = _openlibrary_edition(olid, isbn)
+    for work in _openlibrary_works(edition):
+        found = clean_description(_ol_text(work.get('description')))
+        if found:
+            return found
+    found = clean_description(_ol_text((edition or {}).get('description')))
+    if found:
+        return found
+
+    # No ISBN match on Google, or a match with no blurb: the title search often
+    # finds the same book under a different edition, which will have one.
+    lookup_title = clean(info.get('title')) or clean(title)
+    if not lookup_title:
+        return None
+    lookup_author = clean((info.get('authors') or [None])[0]) or clean(author)
+    if lookup_author and ',' in lookup_author:
+        lookup_author = lookup_author.split(',')[0].strip()
+    for volume in _google_sibling_volumes(lookup_title, lookup_author):
+        found = clean_description((volume.get('volumeInfo') or {}).get('description'))
+        if found:
+            return found
+    return None
+
+
 def _cover_candidates(isbn: Optional[str], olid: Optional[str], cover_url: Optional[str], only_cover_url: bool = False) -> List[str]:
     urls: List[str] = []
     if cover_url:
@@ -1197,13 +1517,16 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
                exclude_tags: Optional[str] = None,
                shelf_id: Optional[int] = None, placed: Optional[bool] = None,
                format: Optional[str] = None, has_format: Optional[bool] = None,
+               series: Optional[str] = None, has_series: Optional[bool] = None,
                current_user: dict = Depends(get_current_user)):
-    """List books. Optional ?q= search over title, author, ISBN, OLID and notes,
-    ?sort=title|author|added, ?dir=asc|desc,
+    """List books. Optional ?q= search over title, author, ISBN, OLID, series
+    and notes,
+    ?sort=title|author|added|location|series, ?dir=asc|desc,
     ?tags=a,b with ?match=any|all (default any), ?exclude_tags=a,b to omit
     books having any listed tag, ?shelf_id= to limit to one shelf,
     ?placed=false to find books with no location yet, ?format= to limit to one
-    binding, and ?has_format=false to find the books still missing one."""
+    binding, ?has_format=false to find the books still missing one, ?series= to
+    limit to one series, and ?has_series=false for the standalones."""
     order = order_by(sort, dir)
     where = []
     params: List = []
@@ -1212,8 +1535,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         # Notes included: it is where "signed", "lent to Sam" and "second copy"
         # live, which are exactly the things you go looking for and cannot find
         # by title.
-        where.append("(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR olid LIKE ? OR notes LIKE ?)")
-        params.extend([pattern] * 5)
+        where.append("(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR olid LIKE ? OR notes LIKE ? OR series LIKE ?)")
+        params.extend([pattern] * 6)
 
     if shelf_id is not None:
         where.append("shelf_id = ?")
@@ -1235,6 +1558,15 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     if has_format is not None:
         where.append("(format IS NOT NULL AND format <> '')" if has_format
                      else "(format IS NULL OR format = '')")
+
+    wanted_series = clean_series(series)
+    if wanted_series:
+        where.append("series = ? COLLATE NOCASE")
+        params.append(wanted_series)
+
+    if has_series is not None:
+        where.append("(series IS NOT NULL AND series <> '')" if has_series
+                     else "(series IS NULL OR series = '')")
 
     wanted = normalize_tags((tags or '').split(','))
     if wanted:
@@ -1385,6 +1717,19 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(require_edit
         # editing a title from an older app should not quietly erase the format.
         if 'format' in sent:
             conn.execute("UPDATE books SET format=? WHERE id=?", (clean_format(b.format), book_id))
+        # Same reasoning for the series and the description: a client that never
+        # loaded them must not blank them by saving a title.
+        if 'series' in sent or 'series_index' in sent:
+            name = clean_series(b.series)
+            index = clean_series_index(b.series_index)
+            # "Wheel of Time #3" typed into the name field is still a number and
+            # a name; split it rather than storing the number twice or not at all.
+            if name and index is None:
+                name, index = split_series(name)
+            conn.execute("UPDATE books SET series=?, series_index=? WHERE id=?",
+                         (name, index if name else None, book_id))
+        if 'description' in sent:
+            conn.execute("UPDATE books SET description=? WHERE id=?", (clean_description(b.description), book_id))
         if location_sent:
             location = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
             conn.execute("UPDATE books SET shelf_id=?, shelf_column=?, shelf_row=? WHERE id=?",
@@ -1416,12 +1761,21 @@ def add_book(b: Book, current_user: dict = Depends(require_editor)):
     # edition; ask OpenLibrary only when it does not, which is the manual and
     # scanned paths.
     b.format = clean_format(b.format) or _openlibrary_format(b.olid, b.isbn)
+    # Same for the series: honour what the client already knows, otherwise ask.
+    b.series = clean_series(b.series)
+    b.series_index = clean_series_index(b.series_index)
+    if b.series and b.series_index is None:
+        b.series, b.series_index = split_series(b.series)
+    if not b.series:
+        b.series, b.series_index = _fetch_series(b.olid, b.isbn, b.title, b.google_id)
+    b.description = clean_description(b.description) or _fetch_description(b.olid, b.isbn, b.title, b.author, b.google_id)
     # Allow an explicit added date (e.g. when restoring a deleted book via undo).
     b.created_at = clean_timestamp(b.created_at) or now_iso()
     b.shelf_id, b.shelf_column, b.shelf_row = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
     try:
-        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, format, created_at, shelf_id, shelf_column, shelf_row) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                           (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.format, b.created_at,
+        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, format, series, series_index, description, created_at, shelf_id, shelf_column, shelf_row) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.format,
+                            b.series, b.series_index, b.description, b.created_at,
                             b.shelf_id, b.shelf_column, b.shelf_row))
         conn.commit()
         b.id = cur.lastrowid
@@ -1530,6 +1884,63 @@ def lookup_book_format(book_id: int, current_user: dict = Depends(require_editor
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone())
 
+@app.post("/books/{book_id}/series/lookup", response_model=Book)
+def lookup_book_series(book_id: int, current_user: dict = Depends(require_editor)):
+    """Fetch the series and volume number for one book.
+
+    OpenLibrary states the series outright on its edition records; where it does
+    not, the series is read out of the parenthesised suffix publishers put on
+    the title. Either way this only ever writes what a catalogue says, so a
+    series typed by hand is replaced only when a lookup actually finds one."""
+    cur = conn.execute("SELECT id, isbn, olid, google_id, title FROM books WHERE id=?", (book_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not clean(row['isbn']) and not clean_olid(row['olid']) and not clean(row['title']):
+        raise HTTPException(status_code=400, detail="This book needs an ISBN, OLID or title to look up its series")
+
+    name, index = _fetch_series(row['olid'], row['isbn'], row['title'], row['google_id'])
+    if not name:
+        raise HTTPException(status_code=404, detail="No series found for this book on OpenLibrary or Google Books")
+
+    conn.execute("UPDATE books SET series=?, series_index=? WHERE id=?", (name, index, book_id))
+    conn.commit()
+    cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
+    return book_from_row(cur.fetchone())
+
+
+@app.post("/books/{book_id}/description/lookup", response_model=Book)
+def lookup_book_description(book_id: int, current_user: dict = Depends(require_editor)):
+    """Fetch the publisher blurb for one book from Google Books, falling back to
+    the OpenLibrary work description."""
+    cur = conn.execute("SELECT id, isbn, olid, google_id, title, author FROM books WHERE id=?", (book_id,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not clean(row['isbn']) and not clean_olid(row['olid']) and not clean(row['title']):
+        raise HTTPException(status_code=400, detail="This book needs an ISBN, OLID or title to look up a description")
+
+    found = _fetch_description(row['olid'], row['isbn'], row['title'], row['author'], row['google_id'])
+    if not found:
+        raise HTTPException(status_code=404, detail="No description found for this book on Google Books or OpenLibrary")
+
+    conn.execute("UPDATE books SET description=? WHERE id=?", (found, book_id))
+    conn.commit()
+    cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
+    return book_from_row(cur.fetchone())
+
+
+@app.get("/series")
+def list_series(current_user: dict = Depends(get_current_user)):
+    """Every series in the library with how many books are in it, so the Manage
+    tab can offer them as a filter."""
+    return [{"name": r['series'], "count": r['n']} for r in conn.execute(
+        """SELECT series, COUNT(*) AS n FROM books
+           WHERE series IS NOT NULL AND series <> ''
+           GROUP BY series COLLATE NOCASE
+           ORDER BY series COLLATE NOCASE""")]
+
+
 @app.get("/formats")
 def list_formats(current_user: dict = Depends(get_current_user)):
     """The bindings offered in the pickers, and whatever else is already in use.
@@ -1613,7 +2024,7 @@ def set_book_location(book_id: int, loc: BookLocation, current_user: dict = Depe
 
 @app.post("/books/import")
 async def import_books(file: UploadFile = File(...), current_user: dict = Depends(require_editor)):
-    """Accepts a CSV file with headers: title,author,isbn,olid,google_id,tags,notes
+    """Accepts a CSV file with headers: title,author,isbn,olid,google_id,tags,notes,series,series_index,description
     (tags separated by ';' or '|', since ',' is the column separator)"""
     content = (await file.read()).decode('utf-8')
     reader = csv.DictReader(io.StringIO(content))
@@ -1628,9 +2039,16 @@ async def import_books(file: UploadFile = File(...), current_user: dict = Depend
         olid = clean_olid(row.get('olid') or row.get('OLID'))
         google_id = clean_google_id(row.get('google_id') or row.get('Google ID') or row.get('googleid'))
         notes = clean(row.get('notes') or row.get('Notes'))
+        series, series_index = split_series(clean(row.get('series') or row.get('Series')))
+        explicit_index = clean_series_index(row.get('series_index') or row.get('Series Index'))
+        if explicit_index is not None:
+            series_index = explicit_index
+        description = clean_description(row.get('description') or row.get('Description'))
         tags = normalize_tags(re.split(r'[;|]', row.get('tags') or row.get('Tags') or ''))
         try:
-            cur = conn.execute("INSERT OR IGNORE INTO books (title, author, isbn, olid, google_id, notes, created_at) VALUES (?,?,?,?,?,?,?)", (title, author, isbn, olid, google_id, notes, added_at))
+            cur = conn.execute("INSERT OR IGNORE INTO books (title, author, isbn, olid, google_id, notes, series, series_index, description, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                               (title, author, isbn, olid, google_id, notes, series,
+                                series_index if series else None, description, added_at))
             if tags and cur.lastrowid and cur.rowcount:
                 set_book_tags(cur.lastrowid, tags)
             inserted += 1

@@ -8,9 +8,15 @@ anywhere Docker does — it was built to live on a Synology NAS.
   page count) or by ISBN, with [Google Books](https://books.google.com) as a
   fallback for anything OpenLibrary does not know about.
 - Browse, search, edit and delete your library from the browser, with undo.
-- Sort the library by title, author, date added or shelf location.
+- Sort the library by title, author, series, date added or shelf location.
 - Record where each book physically lives, on shelves you define yourself.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
+- Series: the series and volume number, read out of OpenLibrary's series field
+  or the published title, kept as separate fields so a series sorts in reading
+  order and shown as "The Stormlight Archive (3)".
+- Descriptions from Google Books or OpenLibrary, collapsed to a one-line preview
+  in the table and opened a row at a time.
+- Both can be filled in across the whole listing at once from the Manage tab.
 - Format: the binding — Hardcover, Paperback and so on — taken from OpenLibrary
   per book, editable by hand, and filterable, including "no format" for the
   books still missing one.
@@ -150,8 +156,10 @@ sudo chown -R <uid>:<gid> ./backend
 
 ## CSV import
 
-Upload a CSV with the headers `title,author,isbn,olid,google_id,tags,notes` (only `title`
-is required). Separate tags with `;` or `|`, since `,` is the column separator.
+Upload a CSV with the headers `title,author,isbn,olid,google_id,tags,notes,series,series_index,description`
+(only `title` is required). Separate tags with `;` or `|`, since `,` is the column
+separator. A `series` written as "Discworld #5" is split into the name and the
+number, so `series_index` only needs supplying when the name does not carry it.
 Rows whose ISBN already exists are skipped.
 
 ## API
@@ -170,7 +178,7 @@ anything; a token from `/token/guest` gets `guest` and is read-only — every
 | `POST`   | `/token/guest`    | Get a read-only guest JWT, no credentials |
 | `GET`    | `/auth/config`    | Whether guest access is enabled          |
 | `GET`    | `/me`             | Caller's username, role and `read_only` flag |
-| `GET`    | `/books`          | List books, optional `?q=` search + sorting + include/exclude tags + `?shelf_id=`/`?placed=` + format filters |
+| `GET`    | `/books`          | List books, optional `?q=` search + sorting + include/exclude tags + `?shelf_id=`/`?placed=` + format filters + `?series=`/`?has_series=` |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
 | `PUT`    | `/books/{id}`     | Update a book                            |
@@ -184,7 +192,10 @@ anything; a token from `/token/guest` gets `guest` and is read-only — every
 | `POST`   | `/books/{id}/google/lookup` | Resolve the Google Books volume id |
 | `POST`   | `/books/{id}/tags/lookup` | Add genre tags, `?replace=true` to swap |
 | `POST`   | `/books/{id}/format/lookup` | Fetch the binding from OpenLibrary |
+| `POST`   | `/books/{id}/series/lookup` | Fetch the series and volume number |
+| `POST`   | `/books/{id}/description/lookup` | Fetch the description        |
 | `GET`    | `/tags`           | Tags in use, with book counts            |
+| `GET`    | `/series`         | Series in use, with book counts          |
 | `GET`    | `/formats`        | Known bindings, and any others in use    |
 | `GET`    | `/shelves`        | Shelves with their sizes and book counts |
 | `POST`   | `/shelves`        | Add a shelf                              |

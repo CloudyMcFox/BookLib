@@ -26,6 +26,7 @@ body{background:#f0f2f5;color:#1a1a1a}
 
 label{display:block;margin:8px 0;font-size:13px;color:#333}
 input{padding:7px 8px;border:1px solid #ccd0d5;border-radius:5px;font-size:14px;width:100%;max-width:100%}
+textarea{padding:7px 8px;border:1px solid #ccd0d5;border-radius:5px;font-size:13px;font-family:inherit;width:100%;max-width:100%;min-width:180px;resize:vertical}
 button{padding:7px 12px;border:1px solid #ccd0d5;border-radius:5px;background:#fff;cursor:pointer;font-size:14px}
 button:hover:not(:disabled){background:#f2f4f7}
 button:disabled{opacity:.6;cursor:default}
@@ -62,7 +63,10 @@ button.danger:hover:not(:disabled){background:#b91c1c}
    scroll horizontally instead. */
 .books .col-notes{min-width:160px}
 .books .col-title{min-width:150px}
-.books .col-author{min-width:120px}
+.books .col-author{width:170px;min-width:150px;max-width:180px}
+.author-cell{display:flex;flex-direction:column;align-items:flex-start;gap:4px;max-width:170px}
+.author-more{padding:1px 6px;font-size:11px;color:#2563eb;background:none;border:0;cursor:pointer}
+.author-more:hover{text-decoration:underline}
 /* An ISBN-13 is 13 digits, or 17 with the hyphens people paste in. Without a
    floor the column collapsed to the narrowest thing in it and the number was
    wrapped mid-digit, in the field you were trying to read it in. */
@@ -98,6 +102,30 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .tags-cell{display:flex;flex-direction:column;gap:6px;min-width:150px;max-width:240px}
 .format-cell{display:flex;flex-direction:column;gap:6px}
 .format-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}
+
+.series-cell{display:flex;flex-direction:column;gap:6px;min-width:130px;max-width:200px}
+.series-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}
+.series-name{font-size:13px}
+
+/* Descriptions are paragraphs, and a paragraph per row turns the table into a
+   wall of text. Collapsed, the cell is a one-line preview; opened, the full
+   blurb gets a row of its own across the whole table rather than stretching
+   one column and every row with it. */
+.books .col-description{min-width:170px;max-width:230px}
+.description-cell{display:flex;flex-direction:column;gap:6px}
+.description-cell > button:last-child{align-self:flex-start;padding:3px 8px;font-size:12px}
+.description-toggle{display:flex;align-items:flex-start;gap:4px;padding:0;border:0;background:none;color:#2563eb;font-size:12px;text-align:left;cursor:pointer;line-height:1.4}
+.description-toggle:hover{text-decoration:underline}
+.description-caret{flex:0 0 auto;color:#888}
+.description-preview{overflow-wrap:anywhere}
+.description-row td{background:#f7f9fc !important;padding:8px 12px}
+.description-full{white-space:pre-wrap;font-size:13px;line-height:1.5;color:#333;max-height:280px;overflow-y:auto}
+
+/* The sweeps that fill a whole listing from the catalogues. Separated from the
+   search controls above them: these write to every book on the page. */
+.bulk-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;padding:6px 8px;border:1px solid #e3e6ea;border-radius:6px;background:#fafbfc}
+.bulk-actions button{padding:3px 9px;font-size:12px}
+.bulk-progress{font-size:12px;color:#2563eb}
 .row-error td{padding:0 8px 8px}
 .row-error .alert{margin:0}
 .tags-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}

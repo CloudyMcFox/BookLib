@@ -47,6 +47,20 @@ function formatAdded(value){
   return d.toLocaleDateString(undefined, {year:'numeric', month:'short', day:'numeric', timeZone:'UTC'})
 }
 
+// Stored apart so a series can be sorted in reading order, but read as one
+// thing: "The Stormlight Archive (2)".
+function seriesLabel(book){
+  const name = t(book && book.series)
+  if(!name) return ''
+  const index = book.series_index
+  if(index===null || index===undefined || index==='') return name
+  const n = Number(index)
+  if(isNaN(n)) return name
+  // Number() already drops a trailing .0, so book 3 reads as "(3)" and a novella
+  // between two volumes reads as "(3.5)".
+  return `${name} (${n})`
+}
+
 // value for <input type="date">, taken from the UTC parts of the stored timestamp
 function toDateInput(value){
   if(!value) return ''
@@ -606,8 +620,79 @@ function FormatCell({book, onChanged, onError}){
   )
 }
 
-// --- shelves ---
+// --- series and description ---
 
+function SeriesCell({book, onChanged, onError}){
+  const readOnly = useReadOnly()
+  const [busy,setBusy]=useState(false)
+  const label = seriesLabel(book)
+
+  const lookup = async ()=>{
+    if(label && !confirm(`Re-fetch the series for "${book.title}"?\n\nIt is currently ${label}.`)) return
+    setBusy(true); onError(null)
+    try{
+      const res = await fetch(`${API_BASE}/books/${book.id}/series/lookup`, {method:'POST', headers: authHeaders()})
+      if(!res.ok){ onError(await readError(res)) }
+      else if(onChanged) onChanged(await res.json())
+    }catch(err){ onError(friendlyMessage(err.message)) }
+    setBusy(false)
+  }
+
+  return (
+    <div className="series-cell">
+      {label ? <span className="series-name">{label}</span> : <span className="muted">Standalone</span>}
+      {!readOnly && (
+        <button type="button" onClick={lookup} disabled={busy}
+                title="Fetch the series from OpenLibrary, falling back to the published title on Google Books">
+          {busy ? '...' : (label ? 'Refresh' : 'Lookup')}
+        </button>
+      )}
+    </div>
+  )
+}
+
+// How much of a description is shown when the row is collapsed. Long enough to
+// tell two books apart, short enough that the table stays a table.
+const DESCRIPTION_PREVIEW = 90
+
+function DescriptionCell({book, expanded, onToggle, onChanged, onError}){
+  const readOnly = useReadOnly()
+  const [busy,setBusy]=useState(false)
+  const text = t(book.description)
+
+  const lookup = async ()=>{
+    if(text && !confirm(`Re-fetch the description for "${book.title}"?\n\nThe stored one, including any you wrote yourself, will be replaced.`)) return
+    setBusy(true); onError(null)
+    try{
+      const res = await fetch(`${API_BASE}/books/${book.id}/description/lookup`, {method:'POST', headers: authHeaders()})
+      if(!res.ok){ onError(await readError(res)) }
+      else if(onChanged) onChanged(await res.json())
+    }catch(err){ onError(friendlyMessage(err.message)) }
+    setBusy(false)
+  }
+
+  const preview = text.length > DESCRIPTION_PREVIEW ? text.slice(0, DESCRIPTION_PREVIEW).trimEnd() + '…' : text
+
+  return (
+    <div className="description-cell">
+      {text
+        ? <button type="button" className="description-toggle" onClick={onToggle}
+                  aria-expanded={expanded} title={expanded ? 'Hide the description' : 'Show the full description'}>
+            <span className="description-caret" aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+            <span className="description-preview">{expanded ? 'Hide description' : preview}</span>
+          </button>
+        : <span className="muted">None</span>}
+      {!readOnly && (
+        <button type="button" onClick={lookup} disabled={busy}
+                title="Fetch the publisher blurb from Google Books, falling back to OpenLibrary">
+          {busy ? '...' : (text ? 'Refresh' : 'Lookup')}
+        </button>
+      )}
+    </div>
+  )
+}
+
+// --- shelves ---
 // The drawn bookcase, ported from the iOS app's BookshelfView so both clients
 // show the same thing. Geometry is in SVG user units; the viewBox scales it to
 // whatever room the page has.
@@ -1517,11 +1602,31 @@ function SourcesCell({book, onChanged, onError}){
   )
 }
 
-function SortHeader({label, field, sort, onSort}){
-  if(!onSort) return <th>{label}</th>
+function AuthorCell({author}){
+  const [expanded,setExpanded] = useState(false)
+  const authors = t(author).split(',').map(t).filter(Boolean)
+  if(!authors.length) return <span className="muted">—</span>
+
+  const hidden = Math.max(0, authors.length - 2)
+  const visible = expanded ? authors : authors.slice(0, 2)
+  return (
+    <div className="author-cell">
+      <span>{visible.join(', ')}</span>
+      {hidden>0 && (
+        <button type="button" className="author-more" onClick={()=>setExpanded(!expanded)}
+                aria-expanded={expanded}>
+          {expanded ? 'Show fewer' : `+${hidden} more`}
+        </button>
+      )}
+    </div>
+  )
+}
+
+function SortHeader({label, field, sort, onSort, className}){
+  if(!onSort) return <th className={className}>{label}</th>
   const active = sort && sort.field === field
   return (
-    <th className="sortable">
+    <th className={['sortable', className].filter(Boolean).join(' ')}>
       <button type="button" className={active? 'sort-btn active':'sort-btn'} onClick={()=>onSort(field)}
               aria-label={`Sort by ${label}`}>
         {label}<span className="sort-arrow">{active ? (sort.dir==='asc' ? '▲' : '▼') : '↕'}</span>
@@ -1533,28 +1638,39 @@ function SortHeader({label, field, sort, onSort}){
 function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate}){
   const readOnly = useReadOnly()
   const [editingId, setEditingId] = useState(null)
-  const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', added:'', addedOriginal:''})
+  const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', series:'', seriesIndex:'', description:'', added:'', addedOriginal:''})
   // Which row the message belongs to, not just the message: an error printed
   // above a long table is off screen for the row that caused it, which reads as
   // the button having done nothing at all.
   const [rowError, setRowError] = useState(null)
+  // Descriptions are paragraphs, so they are collapsed by default and opened a
+  // row at a time. Ids rather than a single id: reading two blurbs side by side
+  // is the whole point of having them in a list.
+  const [openDescriptions, setOpenDescriptions] = useState({})
+  const toggleDescription = (id)=> setOpenDescriptions(prev=> ({...prev, [id]: !prev[id]}))
   const showRowError = (bookId, message)=> setRowError(message ? {bookId, message} : null)
 
   const startEdit = (b)=>{
     setRowError(null)
     setEditingId(b.id)
     const added = toDateInput(b.created_at)
-    setEditVals({title: b.title||'', author: b.author||'', isbn: b.isbn||'', olid: b.olid||'', googleId: b.google_id||'', notes: b.notes||'', tags: (b.tags||[]).join(', '), format: b.format||'', added, addedOriginal: added})
+    setEditVals({title: b.title||'', author: b.author||'', isbn: b.isbn||'', olid: b.olid||'', googleId: b.google_id||'', notes: b.notes||'', tags: (b.tags||[]).join(', '), format: b.format||'', series: b.series||'', seriesIndex: (b.series_index===null||b.series_index===undefined) ? '' : String(b.series_index), description: b.description||'', added, addedOriginal: added})
   }
-  const cancelEdit = ()=>{ setEditingId(null); setRowError(null); setEditVals({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', added:'', addedOriginal:''}) }
+  const cancelEdit = ()=>{ setEditingId(null); setRowError(null); setEditVals({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', series:'', seriesIndex:'', description:'', added:'', addedOriginal:''}) }
 
   const saveEdit = async (book)=>{
     setRowError(null)
     const vals = {title: t(editVals.title), author: t(editVals.author), isbn: t(editVals.isbn), olid: t(editVals.olid),
                   google_id: t(editVals.googleId), notes: t(editVals.notes),
                   tags: editVals.tags.split(',').map(t).filter(Boolean),
-                  format: t(editVals.format)}
+                  format: t(editVals.format),
+                  series: t(editVals.series),
+                  series_index: t(editVals.seriesIndex) === '' ? null : Number(editVals.seriesIndex),
+                  description: t(editVals.description)}
     if(!vals.title){ showRowError(book.id, 'Title is required'); return }
+    if(vals.series_index !== null && (isNaN(vals.series_index) || vals.series_index < 0)){
+      showRowError(book.id, 'Series number must be a number, like 2 or 2.5'); return
+    }
     if(vals.isbn && !validateISBN(vals.isbn)){ showRowError(book.id, 'ISBN must be 10 or 13 digits'); return }
     if(vals.olid){
       const olid = normalizeOlid(vals.olid)
@@ -1591,12 +1707,14 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
         <thead><tr>
           <th>Cover</th>
           <SortHeader label="Title" field="title" sort={sort} onSort={onSort} />
-          <SortHeader label="Author" field="author" sort={sort} onSort={onSort} />
+          <SortHeader label="Author" field="author" sort={sort} onSort={onSort} className="col-author" />
           <th className="col-isbn">ISBN</th>
           <th>Sources</th>
           <SortHeader label="Location" field="location" sort={sort} onSort={onSort} />
+          <SortHeader label="Series" field="series" sort={sort} onSort={onSort} />
           <th>Tags</th>
           <th>Format</th>
+          <th className="col-description">Description</th>
           <th className="col-notes">Notes</th>
           <SortHeader label="Added" field="added" sort={sort} onSort={onSort} />
           {!readOnly && <th></th>}
@@ -1609,17 +1727,27 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
               {editingId===b.id ? (
                 <>
                   <td><input value={editVals.title} onChange={e=>setEditVals({...editVals, title: e.target.value})} /></td>
-                  <td><input value={editVals.author} onChange={e=>setEditVals({...editVals, author: e.target.value})} /></td>
+                  <td className="col-author"><input value={editVals.author} onChange={e=>setEditVals({...editVals, author: e.target.value})} /></td>
                   <td className="col-isbn"><input value={editVals.isbn} onChange={e=>setEditVals({...editVals, isbn: e.target.value})} /></td>
                   <td>
                     <input value={editVals.olid} placeholder="OL12345M" onChange={e=>setEditVals({...editVals, olid: e.target.value})} />
                     <input style={{marginTop:4}} value={editVals.googleId} placeholder="otCEEQAAQBAJ" onChange={e=>setEditVals({...editVals, googleId: e.target.value})} />
                   </td>
                   <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} onLocate={onLocate} /></td>
+                  <td>
+                    <input value={editVals.series} placeholder="Series name"
+                           onChange={e=>setEditVals({...editVals, series: e.target.value})} />
+                    <input style={{marginTop:4}} value={editVals.seriesIndex} placeholder="#" inputMode="decimal"
+                           onChange={e=>setEditVals({...editVals, seriesIndex: e.target.value})} />
+                  </td>
                   <td><input value={editVals.tags} placeholder="comma, separated, tags" onChange={e=>setEditVals({...editVals, tags: e.target.value})} /></td>
                   <td>
                     <input list="known-formats" value={editVals.format} placeholder="Paperback"
                            onChange={e=>setEditVals({...editVals, format: e.target.value})} />
+                  </td>
+                  <td className="col-description">
+                    <textarea rows={3} value={editVals.description} placeholder="Description"
+                              onChange={e=>setEditVals({...editVals, description: e.target.value})} />
                   </td>
                   <td className="col-notes"><input value={editVals.notes} onChange={e=>setEditVals({...editVals, notes: e.target.value})} /></td>
                   <td><input type="date" value={editVals.added} onChange={e=>setEditVals({...editVals, added: e.target.value})} /></td>
@@ -1631,12 +1759,18 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
               ) : (
                 <>
                   <td className="col-title">{b.title}</td>
-                  <td className="col-author">{b.author}</td>
+                  <td className="col-author"><AuthorCell author={b.author} /></td>
                   <td className="col-isbn nowrap">{b.isbn}</td>
                   <td><SourcesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} onLocate={onLocate} /></td>
+                  <td><SeriesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td><TagsCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="nowrap"><FormatCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
+                  <td className="col-description">
+                    <DescriptionCell book={b} expanded={!!openDescriptions[b.id]}
+                                     onToggle={()=>toggleDescription(b.id)}
+                                     onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} />
+                  </td>
                   <td className="col-notes">{b.notes}</td>
                   <td className="nowrap">{formatAdded(b.created_at)}</td>
                   {!readOnly && (
@@ -1648,9 +1782,16 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                 </>
               )}
             </tr>
+            {openDescriptions[b.id] && editingId!==b.id && t(b.description) && (
+              <tr className="description-row">
+                <td colSpan={readOnly ? 12 : 13}>
+                  <div className="description-full">{b.description}</div>
+                </td>
+              </tr>
+            )}
             {rowError && rowError.bookId===b.id && (
               <tr className="row-error">
-                <td colSpan={readOnly ? 10 : 11}><div className="alert">{rowError.message}</div></td>
+                <td colSpan={readOnly ? 12 : 13}><div className="alert">{rowError.message}</div></td>
               </tr>
             )}
             </Fragment>
@@ -1681,6 +1822,9 @@ export default function App(){
   // '' is every shelf, '__unplaced__' is books with no recorded location.
   const [shelfFilter,setShelfFilter]=useState('')
   const [formatsInUse,setFormatsInUse]=useState([])
+  // '' is every series, '__none__' is the standalones.
+  const [seriesFilter,setSeriesFilter]=useState('')
+  const [seriesInUse,setSeriesInUse]=useState([])
   const [tagMatch,setTagMatch]=useState('all')
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
@@ -1710,6 +1854,7 @@ export default function App(){
     const f = {tags: selectedTags, excludes: excludedTags, match: tagMatch,
                shelf: shelfFilter, ...(filterOverride || {})}
     const fmt = f.format===undefined ? formatFilter : f.format
+    const ser = f.series===undefined ? seriesFilter : f.series
     const params = [`sort=${s.field}`, `dir=${s.dir}`]
     if(term) params.push('q=' + encodeURIComponent(term))
     if(f.tags && f.tags.length){
@@ -1725,6 +1870,10 @@ export default function App(){
     // has_format=false instead of as a magic binding name.
     if(fmt==='__none__') params.push('has_format=false')
     else if(fmt) params.push('format=' + encodeURIComponent(fmt))
+    // Same shape as the format filter: "no series" is its own question, not a
+    // series called None.
+    if(ser==='__none__') params.push('has_series=false')
+    else if(ser) params.push('series=' + encodeURIComponent(ser))
     const res = await fetch(API_BASE + '/books?' + params.join('&'), {headers: authHeaders()})
     if(res.status===401){ setLoggedIn(false); return }
     // The API already applied the ordering, so keep the response order as-is.
@@ -1777,6 +1926,18 @@ export default function App(){
     }catch(e){ console.error('fetch formats failed', e) }
   }
 
+  const fetchSeries = async ()=>{
+    try{
+      const res = await fetch(API_BASE + '/series', {headers: authHeaders()})
+      if(res.ok) setSeriesInUse(await res.json())
+    }catch(e){ console.error('fetch series failed', e) }
+  }
+
+  const changeSeriesFilter = (value)=>{
+    setSeriesFilter(value)
+    fetchBooks(undefined, undefined, {series: value})
+  }
+
   const clearTagFilter = ()=>{
     setSelectedTags([])
     setExcludedTags([])
@@ -1802,6 +1963,43 @@ export default function App(){
     setRefreshing(null)
     fetchTags()
   }
+
+  // The sweeps over the whole listing share one shape: confirm, walk the books
+  // one at a time so the catalogues are not hammered, and patch each row as its
+  // answer arrives so progress is visible rather than arriving all at once.
+  // A book the lookup has nothing for answers 404, which is not an error worth
+  // stopping a sweep of two hundred books for.
+  const refreshAllField = async ({endpoint, label, confirmText, after})=>{
+    const targets = books.filter(b=> b.isbn || b.olid || b.title)
+    if(!targets.length) return
+    if(!confirm(confirmText(targets.length))) return
+    let found = 0
+    for(let i=0;i<targets.length;i++){
+      setRefreshing(`${label} ${i+1}/${targets.length}...`)
+      try{
+        const res = await fetch(`${API_BASE}/books/${targets[i].id}/${endpoint}/lookup`, {method:'POST', headers: authHeaders()})
+        if(res.ok){
+          found++
+          const updated = await res.json()
+          setBooks(prev=> prev.map(x=> x.id===updated.id ? {...x, ...updated} : x))
+        }
+      }catch(e){ console.error(`${endpoint} refresh failed`, e) }
+    }
+    setRefreshing(null)
+    if(after) after()
+    alert(`Updated ${found} of ${targets.length} book${targets.length===1?'':'s'}. The rest had nothing on record.`)
+  }
+
+  const refreshAllSeries = ()=> refreshAllField({
+    endpoint: 'series', label: 'Series',
+    confirmText: n=> `Look up the series for ${n} book${n===1?'':'s'}?\n\nAny series recorded by hand will be replaced where a catalogue has one.`,
+    after: fetchSeries,
+  })
+
+  const refreshAllDescriptions = ()=> refreshAllField({
+    endpoint: 'description', label: 'Descriptions',
+    confirmText: n=> `Look up descriptions for ${n} book${n===1?'':'s'}?\n\nDescriptions already stored, including any you wrote yourself, will be replaced where one is found.`,
+  })
 
   const loadMe = async ()=>{
     setMeError(null)
@@ -1829,10 +2027,10 @@ export default function App(){
 
   // Guests have no Add tab, so send them somewhere that exists.
   useEffect(()=>{
-    if(readOnly && tab==='add'){ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() }
+    if(readOnly && tab==='add'){ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() }
   }, [readOnly])
 
-  useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() } }, [loggedIn])
+  useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() } }, [loggedIn])
 
   // If an administrator deletes the shelf currently being filtered, return to
   // all shelves instead of leaving the Manage tab stuck on an impossible id.
@@ -1843,6 +2041,17 @@ export default function App(){
       fetchBooks(undefined, undefined, {shelf: ''})
     }
   }, [shelves, shelfFilter])
+
+  // A series can vanish from the library entirely — the last book in it gets
+  // deleted, or a refresh renames it — which would otherwise leave the filter
+  // stuck on a name that matches nothing.
+  useEffect(()=>{
+    if(seriesFilter && seriesFilter!=='__none__' && seriesInUse.length
+       && !seriesInUse.some(s=> s.name===seriesFilter)){
+      setSeriesFilter('')
+      fetchBooks(undefined, undefined, {series: ''})
+    }
+  }, [seriesInUse, seriesFilter])
 
   const setUndoWithTimeout = (u)=>{
     if(undoTimer) clearTimeout(undoTimer)
@@ -1965,7 +2174,7 @@ export default function App(){
           )}
           <div className="tabs">
             {!readOnly && <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>}
-            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats() }}>{readOnly ? 'Browse' : 'Manage'}</button>
+            <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() }}>{readOnly ? 'Browse' : 'Manage'}</button>
             <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>
           </div>
 
@@ -2003,7 +2212,27 @@ export default function App(){
                   {shelves.map(s=> <option key={s.id} value={String(s.id)}>{s.name}</option>)}
                   <option value="__unplaced__">Not placed</option>
                 </select>
+                <select value={seriesFilter} onChange={e=>changeSeriesFilter(e.target.value)}
+                        title="Show one series">
+                  <option value="">Any series</option>
+                  {seriesInUse.map(s=> <option key={s.name} value={s.name}>{s.name} ({s.count})</option>)}
+                  <option value="__none__">Standalone</option>
+                </select>
               </form>
+              {!readOnly && books.length>0 && (
+                <div className="bulk-actions">
+                  <span className="muted">Fill in the whole list from the catalogues:</span>
+                  <button type="button" onClick={refreshAllSeries} disabled={!!refreshing}
+                          title="Look up the series and volume number for every book listed below">
+                    Refresh all series
+                  </button>
+                  <button type="button" onClick={refreshAllDescriptions} disabled={!!refreshing}
+                          title="Look up the description for every book listed below">
+                    Refresh all descriptions
+                  </button>
+                  {refreshing && <span className="bulk-progress">{refreshing}</span>}
+                </div>
+              )}
               <TagFilter tags={allTags} selected={selectedTags} excluded={excludedTags} match={tagMatch}
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}
                          onRefreshAll={(books.length && !readOnly) ? refreshAllTags : null} refreshing={refreshing} />
