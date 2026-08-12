@@ -73,6 +73,21 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .books .col-isbn{min-width:170px}
 .nowrap{white-space:nowrap}
 
+.checkout-status{display:flex;flex-direction:column;align-items:flex-start;gap:5px;font-size:12px}
+.checkout-status .available{display:inline-block;padding:3px 8px;border-radius:999px;background:#dcfce7;border:1px solid #86efac;color:#166534;white-space:nowrap}
+.checkout-status.checked-out{display:flex;flex-direction:column;gap:2px;min-width:125px;color:#555}
+.checkout-status.checked-out strong{color:#991b1b}
+.checkout-status.checked-out span:last-of-type{font-size:11px;color:#777;white-space:nowrap}
+.checkout-status button{padding:3px 8px;font-size:12px}
+.checkout-error{margin-top:10px;margin-bottom:0}
+.checkout-list{margin-top:10px;border-top:1px solid #e3e6ea}
+.checkout-book{display:flex;align-items:center;gap:12px;padding:9px 4px;border-bottom:1px solid #e3e6ea}
+.checkout-book-details{display:flex;flex-direction:column;gap:3px;flex:1 1 240px;min-width:0}
+.checkout-book-details strong{font-size:14px;overflow-wrap:anywhere}
+.checkout-book-details span{font-size:12px;color:#666}
+.checkout-book > .checkout-status{flex:0 0 170px}
+.checkout-empty{padding:14px 4px}
+
 .olid-link{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#2563eb}
 .sources-cell{display:flex;flex-direction:column;gap:4px;min-width:130px}
 .source-row{display:flex;align-items:center;gap:5px}
@@ -209,6 +224,12 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 @media (prefers-reduced-motion: reduce){
   .shelf-art-pulse,.shelf-art-arrow{animation:none}
   .shelf-art *{transition:none !important}
+}
+
+@media (max-width:600px){
+  .checkout-book{align-items:flex-start;flex-wrap:wrap}
+  .checkout-book-details{flex:1 1 calc(100% - 60px)}
+  .checkout-book > .checkout-status{flex:1 1 180px;margin-left:54px}
 }
 
 .modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:60;padding:16px}

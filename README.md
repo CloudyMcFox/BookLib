@@ -8,6 +8,8 @@ anywhere Docker does — it was built to live on a Synology NAS.
   page count) or by ISBN, with [Google Books](https://books.google.com) as a
   fallback for anything OpenLibrary does not know about.
 - Browse, search, edit and delete your library from the browser, with undo.
+- Check books out under a borrower's name and check them back in; guests can
+  check books out without gaining catalogue-editing or return access.
 - Sort the library by title, author, series, date added or shelf location.
 - Record where each book physically lives, on shelves you define yourself.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
@@ -80,7 +82,7 @@ All settings live in `.env` (never committed — see `.env.example`).
 | ---------------- | -------------------------------------------------------------- |
 | `SECRET_KEY`     | Signs JWT access tokens. **Generate your own.**                 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default `480`, i.e. 8 hours)       |
-| `GUEST_ACCESS_ENABLED` | Set to `false` to remove the read-only guest login (default `true`) |
+| `GUEST_ACCESS_ENABLED` | Set to `false` to remove guest browsing and checkout (default `true`) |
 | `GUEST_TOKEN_EXPIRE_MINUTES` | Guest session lifetime (default `120`)             |
 | `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
 | `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
@@ -168,21 +170,23 @@ All routes except `/health`, `/auth/config`, `/token` and `/token/guest` require
 `Authorization: Bearer <token>` header.
 
 Tokens carry a role. Accounts made with `create_user.py` get `admin` and may do
-anything; a token from `/token/guest` gets `guest` and is read-only — every
-`POST`, `PUT` and `DELETE` below answers `403 Guest accounts are read-only`.
+anything; a token from `/token/guest` gets `guest` and cannot edit the catalogue
+or check books in. Guests may use the checkout route.
 
 | Method   | Path              | Description                              |
 | -------- | ----------------- | ---------------------------------------- |
 | `GET`    | `/health`         | Liveness check                           |
 | `POST`   | `/token`          | Exchange username/password for a JWT     |
-| `POST`   | `/token/guest`    | Get a read-only guest JWT, no credentials |
+| `POST`   | `/token/guest`    | Get a browse/checkout guest JWT, no credentials |
 | `GET`    | `/auth/config`    | Whether guest access is enabled          |
 | `GET`    | `/me`             | Caller's username, role and `read_only` flag |
-| `GET`    | `/books`          | List books, optional `?q=` search + sorting + include/exclude tags + `?shelf_id=`/`?placed=` + format filters + `?series=`/`?has_series=` |
+| `GET`    | `/books`          | List books, optional search, sorting, catalogue filters, and `?checked_out=true|false` |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
 | `PUT`    | `/books/{id}`     | Update a book                            |
 | `DELETE` | `/books/{id}`     | Delete a book                            |
+| `POST`   | `/books/{id}/checkout` | Check out a book under a borrower name |
+| `POST`   | `/books/{id}/checkin` | Check a book back in (admin only)       |
 | `POST`   | `/books/import`   | Bulk import a CSV file                   |
 | `GET`    | `/books/{id}/cover` | Stored cover image (accepts `?token=`) |
 | `POST`   | `/books/{id}/cover` | Upload a cover image                   |
@@ -423,7 +427,8 @@ VITE_API_BASE=http://localhost:8882 npm run dev
 - `.env` and `backend/books.db` are gitignored — keep it that way.
 - Back up `SECRET_KEY`; changing it invalidates every issued token.
 - There is no public registration; users are created with `create_user.py`.
-- The guest login is read-only and needs no password, so anyone who can reach the
-  app can read the whole library. Set `GUEST_ACCESS_ENABLED=false` if that is not
-  what you want.
+- The guest login needs no password, so anyone who can reach the app can read the
+  library and check books out under any name. Only administrators can check
+  books back in. Set
+  `GUEST_ACCESS_ENABLED=false` if that is not what you want.
 - Put the app behind HTTPS before exposing it to the internet.

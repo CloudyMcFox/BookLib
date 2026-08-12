@@ -20,9 +20,9 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-to-a-secure-random-string")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 8))
 
-# Guest access: anyone can take a read-only look at the library without an
-# account. Guests are not rows in users, they are only a claim in the token, so
-# there is no password to leak and nothing to keep in sync. Set
+# Guest access: anyone can browse and use circulation without an account.
+# Guests are not rows in users, they are only a claim in the token, so there is
+# no password to leak and nothing to keep in sync. Set
 # GUEST_ACCESS_ENABLED=false to turn the door off entirely.
 GUEST_ACCESS_ENABLED = os.environ.get("GUEST_ACCESS_ENABLED", "true").strip().lower() not in ("0", "false", "no")
 GUEST_USERNAME = "guest"
@@ -299,6 +299,10 @@ class Book(BaseModel):
     created_at: Optional[str] = None
     # True when a cover image is stored in the database for this book.
     has_cover: bool = False
+    # Circulation is deliberately lightweight for a personal library. Both
+    # values are null while the book is available.
+    borrower_name: Optional[str] = None
+    checked_out_at: Optional[str] = None
     # Write-only helper: when supplied on create/update the image at this URL is
     # downloaded and stored as the book cover.
     cover_url: Optional[str] = None
@@ -346,6 +350,10 @@ class ShelfLayout(BaseModel):
 class UserCreate(BaseModel):
     username: str
     password: str
+
+
+class CheckoutRequest(BaseModel):
+    borrower_name: str
 
 # initialize DB
 conn = get_conn()
@@ -426,6 +434,10 @@ if 'series_index' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN series_index REAL")
 if 'description' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN description TEXT")
+if 'borrower_name' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN borrower_name TEXT")
+if 'checked_out_at' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN checked_out_at TEXT")
 conn.execute("CREATE INDEX IF NOT EXISTS idx_books_shelf ON books(shelf_id)")
 
 # Seed one shelf so the feature works out of the box rather than presenting an
@@ -438,7 +450,8 @@ conn.commit()
 
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
 BOOK_COLUMNS = ("id, title, author, isbn, olid, google_id, notes, format, series, series_index, "
-                "description, created_at, shelf_id, shelf_column, shelf_row, length(cover) AS cover_size")
+                "description, created_at, shelf_id, shelf_column, shelf_row, borrower_name, checked_out_at, "
+                "length(cover) AS cover_size")
 
 # Whitelisted ORDER BY clauses, so the sort parameter can never be injected.
 # Books added before created_at existed sort by id, which preserves insert order.
@@ -736,9 +749,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 
 def require_editor(current_user: dict = Depends(get_current_user)):
-    """Dependency for anything that writes. Guests may look, not touch."""
+    """Dependency for catalogue writes; circulation has separate endpoints."""
     if is_guest(current_user):
-        raise HTTPException(status_code=403, detail="Guest accounts are read-only")
+        raise HTTPException(status_code=403, detail="Guest accounts cannot edit the catalogue")
     return current_user
 
 
@@ -1486,8 +1499,7 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
 
 @app.post("/token/guest", response_model=Token)
 def guest_access_token():
-    """Hand out a read-only token. No credentials: the whole point is that a
-    visitor can browse the library without an account."""
+    """Hand out a guest token for browsing and circulation."""
     if not GUEST_ACCESS_ENABLED:
         raise HTTPException(status_code=404, detail="Guest access is disabled")
     access_token = create_access_token(data={"sub": GUEST_USERNAME, "role": ROLE_GUEST},
@@ -1518,6 +1530,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
                shelf_id: Optional[int] = None, placed: Optional[bool] = None,
                format: Optional[str] = None, has_format: Optional[bool] = None,
                series: Optional[str] = None, has_series: Optional[bool] = None,
+               checked_out: Optional[bool] = None,
                current_user: dict = Depends(get_current_user)):
     """List books. Optional ?q= search over title, author, ISBN, OLID, series
     and notes,
@@ -1526,7 +1539,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     books having any listed tag, ?shelf_id= to limit to one shelf,
     ?placed=false to find books with no location yet, ?format= to limit to one
     binding, ?has_format=false to find the books still missing one, ?series= to
-    limit to one series, and ?has_series=false for the standalones."""
+    limit to one series, ?has_series=false for the standalones, and
+    ?checked_out=true|false to filter by circulation status."""
     order = order_by(sort, dir)
     where = []
     params: List = []
@@ -1567,6 +1581,9 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     if has_series is not None:
         where.append("(series IS NOT NULL AND series <> '')" if has_series
                      else "(series IS NULL OR series = '')")
+
+    if checked_out is not None:
+        where.append("checked_out_at IS NOT NULL" if checked_out else "checked_out_at IS NULL")
 
     wanted = normalize_tags((tags or '').split(','))
     if wanted:
@@ -1796,6 +1813,48 @@ def get_book(book_id: int, current_user: dict = Depends(get_current_user)):
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
     return book_from_row(row)
+
+
+@app.post("/books/{book_id}/checkout", response_model=Book)
+def checkout_book(book_id: int, checkout: CheckoutRequest,
+                  current_user: dict = Depends(get_current_user)):
+    """Check out one available book. This is the one write guests may perform."""
+    borrower_name = clean(checkout.borrower_name)
+    if not borrower_name:
+        raise HTTPException(status_code=400, detail="Borrower name is required")
+    if len(borrower_name) > 100:
+        raise HTTPException(status_code=400, detail="Borrower name must be 100 characters or fewer")
+
+    cur = conn.execute(
+        """UPDATE books SET borrower_name=?, checked_out_at=?
+           WHERE id=? AND checked_out_at IS NULL""",
+        (borrower_name, now_iso(), book_id))
+    conn.commit()
+    if not cur.rowcount:
+        existing = conn.execute("SELECT checked_out_at FROM books WHERE id=?", (book_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=409, detail="This book is already checked out")
+    row = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,)).fetchone()
+    return book_from_row(row)
+
+
+@app.post("/books/{book_id}/checkin", response_model=Book)
+def checkin_book(book_id: int, current_user: dict = Depends(require_editor)):
+    """Return a checked-out book. Only administrators may record returns."""
+    cur = conn.execute(
+        """UPDATE books SET borrower_name=NULL, checked_out_at=NULL
+           WHERE id=? AND checked_out_at IS NOT NULL""",
+        (book_id,))
+    conn.commit()
+    if not cur.rowcount:
+        existing = conn.execute("SELECT checked_out_at FROM books WHERE id=?", (book_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Not found")
+        raise HTTPException(status_code=409, detail="This book is already checked in")
+    row = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,)).fetchone()
+    return book_from_row(row)
+
 
 @app.get("/books/{book_id}/cover")
 def get_book_cover(book_id: int, current_user: dict = Depends(get_current_user_flexible)):

@@ -47,6 +47,13 @@ function formatAdded(value){
   return d.toLocaleDateString(undefined, {year:'numeric', month:'short', day:'numeric', timeZone:'UTC'})
 }
 
+function formatCheckout(value){
+  if(!value) return ''
+  const d = new Date(value)
+  if(isNaN(d.getTime())) return value
+  return d.toLocaleString(undefined, {year:'numeric', month:'short', day:'numeric', hour:'numeric', minute:'2-digit'})
+}
+
 // Stored apart so a series can be sorted in reading order, but read as one
 // thing: "The Stormlight Archive (2)".
 function seriesLabel(book){
@@ -94,9 +101,27 @@ function authHeaders(json){
   return h
 }
 
-// Guests get a token like anyone else, it just carries a read-only role. The
-// server is what enforces that; this context only keeps the UI honest, so the
-// buttons a guest cannot use are never shown in the first place.
+async function checkoutBook(book){
+  const entered = prompt(`Who is checking out "${book.title}"?`)
+  if(entered===null) return null
+  const borrowerName = t(entered)
+  if(!borrowerName) throw new Error('Enter the borrower name')
+  const res = await fetch(`${API_BASE}/books/${book.id}/checkout`, {
+    method:'POST', headers:authHeaders(true),
+    body:JSON.stringify({borrower_name: borrowerName})})
+  if(!res.ok) throw new Error(await readError(res))
+  return await res.json()
+}
+
+async function checkinBook(book){
+  const res = await fetch(`${API_BASE}/books/${book.id}/checkin`, {
+    method:'POST', headers:authHeaders()})
+  if(!res.ok) throw new Error(await readError(res))
+  return await res.json()
+}
+
+// Guests get a token like anyone else. They cannot edit the catalogue or check
+// books in, but the dedicated checkout endpoint lets them borrow books.
 const ReadOnlyContext = createContext(false)
 const useReadOnly = ()=> useContext(ReadOnlyContext)
 
@@ -160,7 +185,7 @@ function Login({onLogin}){
           <button type="button" onClick={guest} disabled={busy}>
             {busy ? 'Opening...' : 'Browse as guest'}
           </button>
-          <span className="muted">Look around and search the library. Guests cannot add, edit or delete books.</span>
+          <span className="muted">Browse the library and check books out. Guests cannot edit the catalogue or check books in.</span>
         </div>
       )}
     </form>
@@ -1622,6 +1647,82 @@ function AuthorCell({author}){
   )
 }
 
+function CheckoutStatus({book, onCheckout, onCheckin, busy}){
+  if(!book.checked_out_at){
+    return (
+      <div className="checkout-status">
+        <span className="available">Available</span>
+        {onCheckout && <button type="button" className="primary" onClick={()=>onCheckout(book)} disabled={busy}>Checkout</button>}
+      </div>
+    )
+  }
+  return (
+    <div className="checkout-status checked-out">
+      <strong>Checked out</strong>
+      <span>{book.borrower_name}</span>
+      <span>{formatCheckout(book.checked_out_at)}</span>
+      {onCheckin && <button type="button" onClick={()=>onCheckin(book)} disabled={busy}>Check in</button>}
+    </div>
+  )
+}
+
+function CheckoutPanel({onBookPatched}){
+  const readOnly = useReadOnly()
+  const [books,setBooks] = useState([])
+  const [q,setQ] = useState('')
+  const [busy,setBusy] = useState(null)
+  const [error,setError] = useState(null)
+
+  const load = async (query)=>{
+    const term = t(query===undefined ? q : query)
+    const params = ['sort=title', 'dir=asc', 'checked_out=true']
+    if(term) params.push('q=' + encodeURIComponent(term))
+    try{
+      const res = await fetch(API_BASE + '/books?' + params.join('&'), {headers: authHeaders()})
+      if(!res.ok){ setError(await readError(res)); return }
+      setBooks(await res.json())
+      setError(null)
+    }catch(err){ setError(friendlyMessage(err.message)) }
+  }
+
+  useEffect(()=>{ load('') }, [])
+
+  const checkin = async (book)=>{
+    setBusy(book.id); setError(null)
+    try{
+      const updated = await checkinBook(book)
+      setBooks(prev=> prev.filter(b=> b.id!==book.id))
+      if(onBookPatched) onBookPatched(updated)
+    }catch(err){ setError(friendlyMessage(err.message)); await load() }
+    finally{ setBusy(null) }
+  }
+
+  return (
+    <div className="card checkout-panel">
+      <h3>Checked out books</h3>
+      <form className="search-row" onSubmit={e=>{ e.preventDefault(); load() }}>
+        <input placeholder="Search title, author, notes or ISBN" value={q} onChange={e=>setQ(e.target.value)} />
+        <button type="submit">Search</button>
+        <button type="button" onClick={()=>{ setQ(''); load('') }}>Clear</button>
+      </form>
+      {error && <div className="alert checkout-error">{error}</div>}
+      <div className="checkout-list">
+        {books.map(book=> (
+          <div className="checkout-book" key={book.id}>
+            <CoverThumb book={book} width={42} />
+            <div className="checkout-book-details">
+              <strong>{book.title}</strong>
+              {book.author && <span>{book.author}</span>}
+            </div>
+            <CheckoutStatus book={book} onCheckin={readOnly ? undefined : checkin} busy={busy===book.id} />
+          </div>
+        ))}
+        {!books.length && <div className="muted checkout-empty">No checked-out books match.</div>}
+      </div>
+    </div>
+  )
+}
+
 function SortHeader({label, field, sort, onSort, className}){
   if(!onSort) return <th className={className}>{label}</th>
   const active = sort && sort.field === field
@@ -1643,12 +1744,23 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
   // above a long table is off screen for the row that caused it, which reads as
   // the button having done nothing at all.
   const [rowError, setRowError] = useState(null)
+  const [circulationBusy, setCirculationBusy] = useState(null)
   // Descriptions are paragraphs, so they are collapsed by default and opened a
   // row at a time. Ids rather than a single id: reading two blurbs side by side
   // is the whole point of having them in a list.
   const [openDescriptions, setOpenDescriptions] = useState({})
   const toggleDescription = (id)=> setOpenDescriptions(prev=> ({...prev, [id]: !prev[id]}))
   const showRowError = (bookId, message)=> setRowError(message ? {bookId, message} : null)
+
+  const changeCirculation = async (book, action)=>{
+    setCirculationBusy(book.id)
+    setRowError(null)
+    try{
+      const updated = action==='checkout' ? await checkoutBook(book) : await checkinBook(book)
+      if(updated && onBookPatched) onBookPatched(updated)
+    }catch(err){ showRowError(book.id, friendlyMessage(err.message)) }
+    finally{ setCirculationBusy(null) }
+  }
 
   const startEdit = (b)=>{
     setRowError(null)
@@ -1717,6 +1829,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
           <th className="col-description">Description</th>
           <th className="col-notes">Notes</th>
           <SortHeader label="Added" field="added" sort={sort} onSort={onSort} />
+          <th>Status</th>
           {!readOnly && <th></th>}
         </tr></thead>
         <tbody>
@@ -1751,6 +1864,10 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   </td>
                   <td className="col-notes"><input value={editVals.notes} onChange={e=>setEditVals({...editVals, notes: e.target.value})} /></td>
                   <td><input type="date" value={editVals.added} onChange={e=>setEditVals({...editVals, added: e.target.value})} /></td>
+                  <td><CheckoutStatus book={b}
+                                      onCheckout={book=>changeCirculation(book, 'checkout')}
+                                      onCheckin={readOnly ? undefined : book=>changeCirculation(book, 'checkin')}
+                                      busy={circulationBusy===b.id} /></td>
                   <td className="nowrap">
                     <button onClick={()=>saveEdit(b)}>Save</button>
                     <button onClick={cancelEdit} style={{marginLeft:6}}>Cancel</button>
@@ -1773,6 +1890,10 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                   </td>
                   <td className="col-notes">{b.notes}</td>
                   <td className="nowrap">{formatAdded(b.created_at)}</td>
+                  <td><CheckoutStatus book={b}
+                                      onCheckout={book=>changeCirculation(book, 'checkout')}
+                                      onCheckin={readOnly ? undefined : book=>changeCirculation(book, 'checkin')}
+                                      busy={circulationBusy===b.id} /></td>
                   {!readOnly && (
                     <td className="nowrap">
                       <button onClick={()=>startEdit(b)}>Edit</button>
@@ -1784,14 +1905,14 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
             </tr>
             {openDescriptions[b.id] && editingId!==b.id && t(b.description) && (
               <tr className="description-row">
-                <td colSpan={readOnly ? 12 : 13}>
+                <td colSpan={readOnly ? 13 : 14}>
                   <div className="description-full">{b.description}</div>
                 </td>
               </tr>
             )}
             {rowError && rowError.bookId===b.id && (
               <tr className="row-error">
-                <td colSpan={readOnly ? 12 : 13}><div className="alert">{rowError.message}</div></td>
+                <td colSpan={readOnly ? 13 : 14}><div className="alert">{rowError.message}</div></td>
               </tr>
             )}
             </Fragment>
@@ -2139,7 +2260,7 @@ export default function App(){
       </datalist>
       <div className="header">
         <h1>Book Library</h1>
-        {readOnly && <span className="guest-badge" title="Guests can view and search, but not change the library">Guest — read only</span>}
+        {readOnly && <span className="guest-badge" title="Guests can browse and use checkout, but cannot edit the catalogue">Guest</span>}
         {loggedIn && <button onClick={logout}>{readOnly ? 'Leave' : 'Logout'}</button>}
       </div>
 
@@ -2175,6 +2296,7 @@ export default function App(){
           <div className="tabs">
             {!readOnly && <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>}
             <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() }}>{readOnly ? 'Browse' : 'Manage'}</button>
+            <button className={tab==='checkout'? 'tab active':'tab'} onClick={()=>setTab('checkout')}>Checkout</button>
             <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>
           </div>
 
@@ -2185,6 +2307,8 @@ export default function App(){
                                 onMoved={(updated)=>{ onBookPatched(updated); fetchShelves() }} />
               {!readOnly && <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks(); setLocationVersion(v=> v+1) }} />}
             </>
+          ) : tab==='checkout' ? (
+            <CheckoutPanel onBookPatched={onBookPatched} />
           ) : (tab==='add' && !readOnly) ? (
             <>
               <AddForm onAdded={onAdded} />
