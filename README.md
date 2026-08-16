@@ -15,7 +15,8 @@ anywhere Docker does — it was built to live on a Synology NAS.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
 - Series: the series and volume number, read out of OpenLibrary's series field
   or the published title, kept as separate fields so a series sorts in reading
-  order and shown as "The Stormlight Archive (3)".
+  order and shown as "The Stormlight Archive (3)". Click a series in the
+  library table to show every book in it.
 - Descriptions from Google Books or OpenLibrary, collapsed to a one-line preview
   in the table and opened a row at a time.
 - Both can be filled in across the whole listing at once from the Manage tab.
@@ -162,7 +163,7 @@ Upload a CSV with the headers `title,author,isbn,olid,google_id,tags,notes,serie
 (only `title` is required). Separate tags with `;` or `|`, since `,` is the column
 separator. A `series` written as "Discworld #5" is split into the name and the
 number, so `series_index` only needs supplying when the name does not carry it.
-Rows whose ISBN already exists are skipped.
+Each CSV row is imported as its own physical copy, even when ISBNs repeat.
 
 ## API
 
@@ -221,6 +222,11 @@ or check books in. Guests may use the checkout route.
 insert order. `created_at` is editable: send a `YYYY-MM-DD` date (or a full
 timestamp) on `POST`/`PUT /books`; omit it on `PUT` to leave the stored value
 untouched. Dates are stored and displayed in UTC.
+
+`POST /books` returns `409` when its ISBN already exists. Repeat the request
+with `?allow_duplicate=true` after confirming that another physical copy should
+be added. Book responses include `copy_count`, and duplicate copies show that
+total beside the title in the library.
 
 Cover images are stored as BLOBs in the `cover` column of the `books` table, with
 the content type in `cover_mime`. Adding a book fetches its cover automatically

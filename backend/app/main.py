@@ -303,6 +303,9 @@ class Book(BaseModel):
     # values are null while the book is available.
     borrower_name: Optional[str] = None
     checked_out_at: Optional[str] = None
+    # Total physical copies carrying this ISBN, including copies outside the
+    # current filtered listing.
+    copy_count: int = 1
     # Write-only helper: when supplied on create/update the image at this URL is
     # downloaded and stored as the book cover.
     cover_url: Optional[str] = None
@@ -361,7 +364,7 @@ conn.execute("""CREATE TABLE IF NOT EXISTS books (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     author TEXT,
-    isbn TEXT UNIQUE,
+    isbn TEXT,
     notes TEXT
 )
 """)
@@ -438,6 +441,57 @@ if 'borrower_name' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN borrower_name TEXT")
 if 'checked_out_at' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN checked_out_at TEXT")
+
+# Early versions made ISBN unique. A personal library may own two physical
+# copies of the same edition, so rebuild that old table once without the
+# constraint. SQLite's automatic unique index cannot be dropped directly.
+_unique_isbn = False
+for _index in conn.execute("PRAGMA index_list(books)").fetchall():
+    if not _index['unique']:
+        continue
+    _columns = [r['name'] for r in conn.execute(f"PRAGMA index_info('{_index['name']}')").fetchall()]
+    if _columns == ['isbn']:
+        _unique_isbn = True
+        break
+if _unique_isbn:
+    conn.commit()
+    try:
+        conn.execute("BEGIN")
+        conn.execute("""CREATE TABLE books_without_unique_isbn (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            author TEXT,
+            isbn TEXT,
+            notes TEXT,
+            cover BLOB,
+            cover_mime TEXT,
+            created_at TEXT,
+            olid TEXT,
+            google_id TEXT,
+            shelf_id INTEGER,
+            shelf_column INTEGER,
+            shelf_row INTEGER,
+            format TEXT,
+            series TEXT,
+            series_index REAL,
+            description TEXT,
+            borrower_name TEXT,
+            checked_out_at TEXT
+        )""")
+        _book_storage_columns = (
+            "id, title, author, isbn, notes, cover, cover_mime, created_at, olid, google_id, "
+            "shelf_id, shelf_column, shelf_row, format, series, series_index, description, "
+            "borrower_name, checked_out_at"
+        )
+        conn.execute(
+            f"INSERT INTO books_without_unique_isbn ({_book_storage_columns}) "
+            f"SELECT {_book_storage_columns} FROM books")
+        conn.execute("DROP TABLE books")
+        conn.execute("ALTER TABLE books_without_unique_isbn RENAME TO books")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 conn.execute("CREATE INDEX IF NOT EXISTS idx_books_shelf ON books(shelf_id)")
 
 # Seed one shelf so the feature works out of the box rather than presenting an
@@ -451,6 +505,11 @@ conn.commit()
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
 BOOK_COLUMNS = ("id, title, author, isbn, olid, google_id, notes, format, series, series_index, "
                 "description, created_at, shelf_id, shelf_column, shelf_row, borrower_name, checked_out_at, "
+                """CASE WHEN isbn IS NULL OR TRIM(isbn)='' THEN 1 ELSE
+                   (SELECT COUNT(*) FROM books AS copies
+                    WHERE REPLACE(REPLACE(copies.isbn, '-', ''), ' ', '') =
+                          REPLACE(REPLACE(books.isbn, '-', ''), ' ', ''))
+                   END AS copy_count, """
                 "length(cover) AS cover_size")
 
 # Whitelisted ORDER BY clauses, so the sort parameter can never be injected.
@@ -1767,11 +1826,27 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(require_edit
     return book_from_row(row)
 
 @app.post("/books", response_model=Book)
-def add_book(b: Book, current_user: dict = Depends(require_editor)):
+def add_book(b: Book, allow_duplicate: bool = False,
+             current_user: dict = Depends(require_editor)):
     title = clean(b.title)
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
     b.title, b.author, b.isbn, b.notes = title, clean(b.author), clean(b.isbn), clean(b.notes)
+    normalized_isbn = re.sub(r'[-\s]', '', b.isbn or '')
+    if normalized_isbn and not allow_duplicate:
+        existing = next((
+            row for row in conn.execute(
+                "SELECT id, title, author, isbn FROM books WHERE isbn IS NOT NULL AND isbn <> ''").fetchall()
+            if re.sub(r'[-\s]', '', row['isbn']) == normalized_isbn
+        ), None)
+        if existing:
+            raise HTTPException(status_code=409, detail={
+                "code": "duplicate_isbn",
+                "message": "A copy with this ISBN is already in the library",
+                "book_id": existing['id'],
+                "title": existing['title'],
+                "author": existing['author'],
+            })
     b.olid = clean_olid(b.olid)
     b.google_id = clean_google_id(b.google_id)
     # The client knows the binding when the book was added from a chosen
@@ -1804,6 +1879,13 @@ def add_book(b: Book, current_user: dict = Depends(require_editor)):
     # Tags: use what the caller supplied, otherwise fetch OpenLibrary subjects.
     supplied = normalize_tags(b.tags)
     b.tags = set_book_tags(b.id, supplied) if supplied else add_book_tags(b.id, _fetch_genres(b.olid, b.isbn, b.title, b.author, b.google_id))
+    if b.isbn:
+        normalized_isbn = re.sub(r'[-\s]', '', b.isbn)
+        b.copy_count = sum(
+            1 for row in conn.execute(
+                "SELECT isbn FROM books WHERE isbn IS NOT NULL AND isbn <> ''").fetchall()
+            if re.sub(r'[-\s]', '', row['isbn']) == normalized_isbn
+        )
     return b
 
 @app.get("/books/{book_id}", response_model=Book)
@@ -2105,7 +2187,7 @@ async def import_books(file: UploadFile = File(...), current_user: dict = Depend
         description = clean_description(row.get('description') or row.get('Description'))
         tags = normalize_tags(re.split(r'[;|]', row.get('tags') or row.get('Tags') or ''))
         try:
-            cur = conn.execute("INSERT OR IGNORE INTO books (title, author, isbn, olid, google_id, notes, series, series_index, description, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, series, series_index, description, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                                (title, author, isbn, olid, google_id, notes, series,
                                 series_index if series else None, description, added_at))
             if tags and cur.lastrowid and cur.rowcount:

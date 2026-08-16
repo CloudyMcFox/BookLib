@@ -68,6 +68,12 @@ function seriesLabel(book){
   return `${name} (${n})`
 }
 
+function CopyCount({book}){
+  const count = Number(book && book.copy_count) || 1
+  if(count < 2) return null
+  return <span className="copy-count">{count} copies</span>
+}
+
 // value for <input type="date">, taken from the UTC parts of the stored timestamp
 function toDateInput(value){
   if(!value) return ''
@@ -92,6 +98,27 @@ async function readError(res){
   let body = ''
   try{ body = JSON.stringify(await res.json()) }catch(_){ try{ body = await res.text() }catch(__){ body = `HTTP ${res.status}` } }
   return friendlyMessage(body)
+}
+
+async function createBook(payload){
+  let res = await fetch(API_BASE + '/books', {
+    method:'POST', headers:authHeaders(true), body:JSON.stringify(payload)})
+  if(res.status===409){
+    let body = null
+    try{ body = await res.json() }catch(_){ /* handled as an ordinary error below */ }
+    const detail = body && body.detail
+    if(detail && detail.code==='duplicate_isbn'){
+      const existing = `${detail.title || 'This book'}${detail.author ? ` by ${detail.author}` : ''}`
+      const isbn = t(payload && payload.isbn)
+      if(!confirm(`${existing}${isbn ? ` (${isbn})` : ''} is already in your library!\n\nAdd another copy?`)) return null
+      res = await fetch(API_BASE + '/books?allow_duplicate=true', {
+        method:'POST', headers:authHeaders(true), body:JSON.stringify(payload)})
+    } else {
+      throw new Error(friendlyMessage(body || `HTTP ${res.status}`))
+    }
+  }
+  if(!res.ok) throw new Error(await readError(res))
+  return await res.json()
 }
 
 function authHeaders(json){
@@ -226,9 +253,8 @@ function AddForm({onAdded}){
       vals.olid = olid
     }
     try{
-      const res = await fetch(API_BASE + '/books',{method:'POST', headers: authHeaders(true), body: JSON.stringify(vals)})
-      if(!res.ok){ setError(await readError(res)); return }
-      const created = await res.json()
+      const created = await createBook(vals)
+      if(!created) return
       setTitle(''); setAuthor(''); setIsbn(''); setOlid(''); setGoogleId(''); setNotes(''); setFormat('')
       setSearchResults([])
       onAdded(created)
@@ -310,9 +336,8 @@ function AddForm({onAdded}){
                       // The chosen edition already says how it is bound; no reason to make the server go and ask.
                       format: formatVal || (details && details.format) || null }
     try{
-      const r = await fetch(API_BASE + '/books', {method: 'POST', headers: authHeaders(true), body: JSON.stringify(payload)})
-      if(!r.ok){ setError(await readError(r)); return }
-      const created = await r.json()
+      const created = await createBook(payload)
+      if(!created) return
       setError(null)
       onAdded(created)
       setSearchResults([])
@@ -647,7 +672,7 @@ function FormatCell({book, onChanged, onError}){
 
 // --- series and description ---
 
-function SeriesCell({book, onChanged, onError}){
+function SeriesCell({book, onChanged, onError, onSeriesClick}){
   const readOnly = useReadOnly()
   const [busy,setBusy]=useState(false)
   const label = seriesLabel(book)
@@ -665,7 +690,11 @@ function SeriesCell({book, onChanged, onError}){
 
   return (
     <div className="series-cell">
-      {label ? <span className="series-name">{label}</span> : <span className="muted">Standalone</span>}
+      {label
+        ? <button type="button" className="series-name series-link"
+                  onClick={()=>onSeriesClick && onSeriesClick(book.series)}
+                  title={`Show all books in ${book.series}`}>{label}</button>
+        : <span className="muted">Standalone</span>}
       {!readOnly && (
         <button type="button" onClick={lookup} disabled={busy}
                 title="Fetch the series from OpenLibrary, falling back to the published title on Google Books">
@@ -1711,7 +1740,7 @@ function CheckoutPanel({onBookPatched}){
           <div className="checkout-book" key={book.id}>
             <CoverThumb book={book} width={42} />
             <div className="checkout-book-details">
-              <strong>{book.title}</strong>
+              <strong>{book.title} <CopyCount book={book} /></strong>
               {book.author && <span>{book.author}</span>}
             </div>
             <CheckoutStatus book={book} onCheckin={readOnly ? undefined : checkin} busy={busy===book.id} />
@@ -1736,7 +1765,7 @@ function SortHeader({label, field, sort, onSort, className}){
   )
 }
 
-function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate}){
+function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate, onSeriesClick}){
   const readOnly = useReadOnly()
   const [editingId, setEditingId] = useState(null)
   const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', series:'', seriesIndex:'', description:'', added:'', addedOriginal:''})
@@ -1875,12 +1904,14 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                 </>
               ) : (
                 <>
-                  <td className="col-title">{b.title}</td>
+                  <td className="col-title"><span>{b.title}</span> <CopyCount book={b} /></td>
                   <td className="col-author"><AuthorCell author={b.author} /></td>
                   <td className="col-isbn nowrap">{b.isbn}</td>
                   <td><SourcesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="nowrap"><LocationCell book={b} shelves={shelves} onPlace={onPlace} onLocate={onLocate} /></td>
-                  <td><SeriesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
+                  <td><SeriesCell book={b} onChanged={onBookPatched}
+                                  onError={m=> showRowError(b.id, m)}
+                                  onSeriesClick={onSeriesClick} /></td>
                   <td><TagsCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="nowrap"><FormatCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
                   <td className="col-description">
@@ -2059,6 +2090,17 @@ export default function App(){
     fetchBooks(undefined, undefined, {series: value})
   }
 
+  const showSeries = (value)=>{
+    setTab('manage')
+    setQ('')
+    setSelectedTags([])
+    setExcludedTags([])
+    setFormatFilter('')
+    setShelfFilter('')
+    setSeriesFilter(value)
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value})
+  }
+
   const clearTagFilter = ()=>{
     setSelectedTags([])
     setExcludedTags([])
@@ -2189,7 +2231,7 @@ export default function App(){
     if(!undo) return
     try{
       if(undo.type==='delete'){
-        const res = await fetch(API_BASE + '/books', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
+        const res = await fetch(API_BASE + '/books?allow_duplicate=true', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
         if(res.ok){
           const restored = await res.json()
           if(undo.wasRecent) setRecent(prev=> sortNewestFirst([restored, ...prev]))
@@ -2314,7 +2356,7 @@ export default function App(){
               <AddForm onAdded={onAdded} />
               <div className="card" style={{minWidth:0}}>
                 <h3>Recently added this session</h3>
-                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
+                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
               </div>
             </>
           ) : (
@@ -2361,7 +2403,7 @@ export default function App(){
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}
                          onRefreshAll={(books.length && !readOnly) ? refreshAllTags : null} refreshing={refreshing} />
               <div style={{margin:'8px 0',color:'#666',fontSize:13}}>{books.length} book{books.length===1?'':'s'}</div>
-              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} emptyText="No books match." />
+              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} emptyText="No books match." />
             </div>
           )}
         </>

@@ -63,6 +63,7 @@ button.danger:hover:not(:disabled){background:#b91c1c}
    scroll horizontally instead. */
 .books .col-notes{min-width:160px}
 .books .col-title{min-width:150px}
+.copy-count{display:inline-block;margin-left:4px;padding:1px 6px;border-radius:999px;background:#f3e8ff;border:1px solid #d8b4fe;color:#6b21a8;font-size:11px;font-weight:600;white-space:nowrap;vertical-align:middle}
 .books .col-author{width:170px;min-width:150px;max-width:180px}
 .author-cell{display:flex;flex-direction:column;align-items:flex-start;gap:4px;max-width:170px}
 .author-more{padding:1px 6px;font-size:11px;color:#2563eb;background:none;border:0;cursor:pointer}
@@ -121,6 +122,8 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .series-cell{display:flex;flex-direction:column;gap:6px;min-width:130px;max-width:200px}
 .series-cell button{align-self:flex-start;padding:3px 8px;font-size:12px}
 .series-name{font-size:13px}
+.series-cell .series-link{padding:0;border:0;background:none;color:#2563eb;text-align:left;line-height:1.35}
+.series-cell .series-link:hover:not(:disabled){background:none;text-decoration:underline}
 
 /* Descriptions are paragraphs, and a paragraph per row turns the table into a
    wall of text. Collapsed, the cell is a one-line preview; opened, the full
