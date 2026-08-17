@@ -228,6 +228,10 @@ with `?allow_duplicate=true` after confirming that another physical copy should
 be added. Book responses include `copy_count`, and duplicate copies show that
 total beside the title in the library.
 
+Books with the same normalized title and author but different ISBNs show an
+**Other edition available** badge. Clicking it filters the library to those
+editions.
+
 Cover images are stored as BLOBs in the `cover` column of the `books` table, with
 the content type in `cover_mime`. Adding a book fetches its cover automatically
 (from the chosen edition, its OLID, or its ISBN, then Google Books); for books
@@ -235,6 +239,11 @@ that have none, use the **Lookup** button in the Manage tab, paste a direct imag
 address, or **Upload** your own file. List responses never carry the image data —
 they return a `has_cover` flag, and the bytes are served on demand from
 `GET /books/{id}/cover`.
+
+Automatic format, series, description, cover and genre enrichment runs after a
+new book has been saved and returned to the client. Slow or unavailable public
+catalogues therefore do not delay the local add operation; reload the listing
+to see metadata that finished in the background.
 
 Books have a dedicated `olid` column for the OpenLibrary edition id. It is filled
 in automatically when you add from search results and is optional everywhere

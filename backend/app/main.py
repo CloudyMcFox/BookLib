@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, BackgroundTasks
 from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -306,6 +306,8 @@ class Book(BaseModel):
     # Total physical copies carrying this ISBN, including copies outside the
     # current filtered listing.
     copy_count: int = 1
+    # Books with the same normalized title and author but a different ISBN.
+    other_edition_count: int = 0
     # Write-only helper: when supplied on create/update the image at this URL is
     # downloaded and stored as the book cover.
     cover_url: Optional[str] = None
@@ -538,6 +540,48 @@ def order_by(sort: Optional[str], direction: Optional[str]) -> str:
 
 def now_iso() -> str:
     return datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _edition_identity(title: Optional[str], author: Optional[str], isbn: Optional[str]) -> tuple:
+    return (_normalized(title), _normalized(author), re.sub(r'[^0-9Xx]', '', isbn or '').lower())
+
+
+def matching_edition_ids(book_id: int) -> List[int]:
+    target = conn.execute("SELECT id, title, author, isbn FROM books WHERE id=?", (book_id,)).fetchone()
+    if not target:
+        return []
+    wanted_title, wanted_author, wanted_isbn = _edition_identity(
+        target['title'], target['author'], target['isbn'])
+    if not wanted_title or not wanted_author or not wanted_isbn:
+        return [book_id]
+    matches = []
+    found_isbns = set()
+    for row in conn.execute("SELECT id, title, author, isbn FROM books").fetchall():
+        title, author, isbn = _edition_identity(row['title'], row['author'], row['isbn'])
+        if title == wanted_title and author == wanted_author and isbn:
+            matches.append(row['id'])
+            found_isbns.add(isbn)
+    return matches if len(found_isbns) > 1 else [book_id]
+
+
+def add_other_edition_counts(books: List[Book]) -> List[Book]:
+    if not books:
+        return books
+    rows = conn.execute("SELECT id, title, author, isbn FROM books").fetchall()
+    groups: dict = {}
+    identities: dict = {}
+    for row in rows:
+        title, author, isbn = _edition_identity(row['title'], row['author'], row['isbn'])
+        identities[row['id']] = (title, author, isbn)
+        if title and author and isbn:
+            groups.setdefault((title, author), set()).add(isbn)
+    for book in books:
+        title, author, isbn = identities.get(
+            book.id, _edition_identity(book.title, book.author, book.isbn))
+        isbns = groups.get((title, author), set())
+        if isbn and len(isbns) > 1:
+            book.other_edition_count = len(isbns - {isbn})
+    return books
 
 
 # --- shelf helpers ---
@@ -1542,6 +1586,41 @@ def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_u
     return False
 
 
+def _enrich_new_book(book_id: int, title: str, author: Optional[str],
+                     isbn: Optional[str], olid: Optional[str],
+                     google_id: Optional[str], cover_url: Optional[str],
+                     needs_format: bool, needs_series: bool,
+                     needs_description: bool, needs_tags: bool):
+    """Fill optional catalogue metadata after the create response is sent.
+
+    External catalogues can take minutes when several requests hit their
+    timeout. The physical book already exists at this point, so that work must
+    not make the create request look like it failed."""
+    if needs_format:
+        found_format = _openlibrary_format(olid, isbn)
+        if found_format:
+            conn.execute("UPDATE books SET format=? WHERE id=?", (found_format, book_id))
+            conn.commit()
+
+    if needs_series:
+        series, series_index = _fetch_series(olid, isbn, title, google_id)
+        if series:
+            conn.execute("UPDATE books SET series=?, series_index=? WHERE id=?",
+                         (series, series_index, book_id))
+            conn.commit()
+
+    if needs_description:
+        description = _fetch_description(olid, isbn, title, author, google_id)
+        if description:
+            conn.execute("UPDATE books SET description=? WHERE id=?", (description, book_id))
+            conn.commit()
+
+    _store_cover(book_id, isbn, olid, cover_url, google_id=google_id)
+
+    if needs_tags:
+        add_book_tags(book_id, _fetch_genres(olid, isbn, title, author, google_id))
+
+
 # --- routes ---
 @app.get("/health")
 def health():
@@ -1590,6 +1669,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
                format: Optional[str] = None, has_format: Optional[bool] = None,
                series: Optional[str] = None, has_series: Optional[bool] = None,
                checked_out: Optional[bool] = None,
+               edition_of: Optional[int] = None,
                current_user: dict = Depends(get_current_user)):
     """List books. Optional ?q= search over title, author, ISBN, OLID, series
     and notes,
@@ -1644,6 +1724,13 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     if checked_out is not None:
         where.append("checked_out_at IS NOT NULL" if checked_out else "checked_out_at IS NULL")
 
+    if edition_of is not None:
+        edition_ids = matching_edition_ids(edition_of)
+        if not edition_ids:
+            raise HTTPException(status_code=404, detail="Not found")
+        where.append("id IN (" + ",".join("?" * len(edition_ids)) + ")")
+        params.extend(edition_ids)
+
     wanted = normalize_tags((tags or '').split(','))
     if wanted:
         placeholders = ",".join("?" * len(wanted))
@@ -1670,7 +1757,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         sql += " WHERE " + " AND ".join(where)
     rows = conn.execute(sql + order, params).fetchall()
     grouped = tags_for_books([r['id'] for r in rows])
-    return [book_from_row(r, grouped.get(r['id'], [])) for r in rows]
+    return add_other_edition_counts(
+        [book_from_row(r, grouped.get(r['id'], [])) for r in rows])
 
 @app.get("/shelves", response_model=List[Shelf])
 def list_shelves(current_user: dict = Depends(get_current_user)):
@@ -1826,7 +1914,8 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(require_edit
     return book_from_row(row)
 
 @app.post("/books", response_model=Book)
-def add_book(b: Book, allow_duplicate: bool = False,
+def add_book(b: Book, background_tasks: BackgroundTasks,
+             allow_duplicate: bool = False,
              current_user: dict = Depends(require_editor)):
     title = clean(b.title)
     if not title:
@@ -1849,18 +1938,15 @@ def add_book(b: Book, allow_duplicate: bool = False,
             })
     b.olid = clean_olid(b.olid)
     b.google_id = clean_google_id(b.google_id)
-    # The client knows the binding when the book was added from a chosen
-    # edition; ask OpenLibrary only when it does not, which is the manual and
-    # scanned paths.
-    b.format = clean_format(b.format) or _openlibrary_format(b.olid, b.isbn)
-    # Same for the series: honour what the client already knows, otherwise ask.
+    # Store what the caller already knows. Missing optional catalogue metadata
+    # is fetched after the response so a slow external service cannot make a
+    # successful local insert appear to fail.
+    b.format = clean_format(b.format)
     b.series = clean_series(b.series)
     b.series_index = clean_series_index(b.series_index)
     if b.series and b.series_index is None:
         b.series, b.series_index = split_series(b.series)
-    if not b.series:
-        b.series, b.series_index = _fetch_series(b.olid, b.isbn, b.title, b.google_id)
-    b.description = clean_description(b.description) or _fetch_description(b.olid, b.isbn, b.title, b.author, b.google_id)
+    b.description = clean_description(b.description)
     # Allow an explicit added date (e.g. when restoring a deleted book via undo).
     b.created_at = clean_timestamp(b.created_at) or now_iso()
     b.shelf_id, b.shelf_column, b.shelf_row = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
@@ -1873,12 +1959,13 @@ def add_book(b: Book, allow_duplicate: bool = False,
         b.id = cur.lastrowid
     except sqlite3.IntegrityError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # Grab a cover while we are adding, so most books never need a manual lookup.
-    b.has_cover = _store_cover(b.id, b.isbn, b.olid, clean(b.cover_url), google_id=b.google_id)
+    b.has_cover = False
+    requested_cover = clean(b.cover_url)
     b.cover_url = None
-    # Tags: use what the caller supplied, otherwise fetch OpenLibrary subjects.
+    # User-supplied tags are local and cheap. Catalogue-derived tags join the
+    # rest of the optional enrichment in the background.
     supplied = normalize_tags(b.tags)
-    b.tags = set_book_tags(b.id, supplied) if supplied else add_book_tags(b.id, _fetch_genres(b.olid, b.isbn, b.title, b.author, b.google_id))
+    b.tags = set_book_tags(b.id, supplied) if supplied else []
     if b.isbn:
         normalized_isbn = re.sub(r'[-\s]', '', b.isbn)
         b.copy_count = sum(
@@ -1886,6 +1973,11 @@ def add_book(b: Book, allow_duplicate: bool = False,
                 "SELECT isbn FROM books WHERE isbn IS NOT NULL AND isbn <> ''").fetchall()
             if re.sub(r'[-\s]', '', row['isbn']) == normalized_isbn
         )
+    add_other_edition_counts([b])
+    background_tasks.add_task(
+        _enrich_new_book, b.id, b.title, b.author, b.isbn, b.olid, b.google_id,
+        requested_cover, not bool(b.format), not bool(b.series),
+        not bool(b.description), not bool(supplied))
     return b
 
 @app.get("/books/{book_id}", response_model=Book)
@@ -2603,10 +2695,10 @@ def lookup_isbn(isbn: str, current_user: dict = Depends(get_current_user)):
             "authors": authors,
             "publish_date": item.get("publish_date"),
             "olid": clean_olid(item.get("key")) or _lookup_olid_by_isbn(isbn),
-            # Worth resolving even when OpenLibrary answered: storing it makes
-            # later tag and cover lookups a single request.
-            "google_id": _resolve_google_id(isbn, item.get("title"),
-                                            authors[0] if authors else None),
+            # One direct ISBN request is useful and cached. Avoid
+            # _resolve_google_id here because its title/author fallbacks can
+            # issue several more requests when Google does not index the ISBN.
+            "google_id": (_google_volume_item(isbn) or {}).get("id"),
             "source": "openlibrary",
         }
 

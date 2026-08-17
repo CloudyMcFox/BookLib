@@ -74,6 +74,17 @@ function CopyCount({book}){
   return <span className="copy-count">{count} copies</span>
 }
 
+function EditionBadge({book, onClick}){
+  const count = Number(book && book.other_edition_count) || 0
+  if(!count) return null
+  return (
+    <button type="button" className="edition-badge" onClick={()=>onClick && onClick(book)}
+            title="Show this book and its other editions">
+      {count === 1 ? 'Other edition available' : `${count} other editions available`}
+    </button>
+  )
+}
+
 // value for <input type="date">, taken from the UTC parts of the stored timestamp
 function toDateInput(value){
   if(!value) return ''
@@ -280,14 +291,6 @@ function AddForm({onAdded}){
       if(j.google_id) setGoogleId(j.google_id)
       if(!foundTitle && !foundAuthor && !j.olid){ setError('No data found'); setLoading(false); return }
       setLoading(false)
-      // Chain straight into the edition search: the point of a lookup is almost
-      // always to then pick the right edition, and the ISBN we just resolved
-      // highlights the matching one. Search on what the lookup returned rather
-      // than on the form, so a lookup that only resolves an OLID cannot search
-      // using the previous book's title and quietly return the wrong editions.
-      if(foundTitle || foundAuthor){
-        await searchMeta(undefined, {title: foundTitle, author: foundAuthor})
-      }
       return
     }catch(err){ setError(err.message) }
     setLoading(false)
@@ -1765,7 +1768,7 @@ function SortHeader({label, field, sort, onSort, className}){
   )
 }
 
-function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate, onSeriesClick}){
+function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate, onSeriesClick, onEditionsClick}){
   const readOnly = useReadOnly()
   const [editingId, setEditingId] = useState(null)
   const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', series:'', seriesIndex:'', description:'', added:'', addedOriginal:''})
@@ -1904,7 +1907,10 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
                 </>
               ) : (
                 <>
-                  <td className="col-title"><span>{b.title}</span> <CopyCount book={b} /></td>
+                  <td className="col-title">
+                    <span>{b.title}</span> <CopyCount book={b} />
+                    <EditionBadge book={b} onClick={onEditionsClick} />
+                  </td>
                   <td className="col-author"><AuthorCell author={b.author} /></td>
                   <td className="col-isbn nowrap">{b.isbn}</td>
                   <td><SourcesCell book={b} onChanged={onBookPatched} onError={m=> showRowError(b.id, m)} /></td>
@@ -1977,6 +1983,7 @@ export default function App(){
   // '' is every series, '__none__' is the standalones.
   const [seriesFilter,setSeriesFilter]=useState('')
   const [seriesInUse,setSeriesInUse]=useState([])
+  const [editionFilter,setEditionFilter]=useState(null)
   const [tagMatch,setTagMatch]=useState('all')
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
@@ -2004,7 +2011,7 @@ export default function App(){
     const term = t(query===undefined ? q : query)
     const s = sortOverride || sort
     const f = {tags: selectedTags, excludes: excludedTags, match: tagMatch,
-               shelf: shelfFilter, ...(filterOverride || {})}
+               shelf: shelfFilter, edition: editionFilter, ...(filterOverride || {})}
     const fmt = f.format===undefined ? formatFilter : f.format
     const ser = f.series===undefined ? seriesFilter : f.series
     const params = [`sort=${s.field}`, `dir=${s.dir}`]
@@ -2026,6 +2033,7 @@ export default function App(){
     // series called None.
     if(ser==='__none__') params.push('has_series=false')
     else if(ser) params.push('series=' + encodeURIComponent(ser))
+    if(f.edition) params.push('edition_of=' + encodeURIComponent(f.edition.id))
     const res = await fetch(API_BASE + '/books?' + params.join('&'), {headers: authHeaders()})
     if(res.status===401){ setLoggedIn(false); return }
     // The API already applied the ordering, so keep the response order as-is.
@@ -2098,7 +2106,20 @@ export default function App(){
     setFormatFilter('')
     setShelfFilter('')
     setSeriesFilter(value)
-    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value})
+    setEditionFilter(null)
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value, edition: null})
+  }
+
+  const showEditions = (book)=>{
+    setTab('manage')
+    setQ('')
+    setSelectedTags([])
+    setExcludedTags([])
+    setFormatFilter('')
+    setShelfFilter('')
+    setSeriesFilter('')
+    setEditionFilter({id: book.id, title: book.title})
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', edition: {id: book.id}})
   }
 
   const clearTagFilter = ()=>{
@@ -2292,7 +2313,7 @@ export default function App(){
     fetchFormats()
   }
 
-  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setExcludedTags([]); setFormatFilter(''); setShelfFilter(''); setFormatsInUse([]) }
+  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setExcludedTags([]); setFormatFilter(''); setShelfFilter(''); setFormatsInUse([]); setEditionFilter(null) }
 
   return (
     <ReadOnlyContext.Provider value={readOnly}>
@@ -2356,7 +2377,7 @@ export default function App(){
               <AddForm onAdded={onAdded} />
               <div className="card" style={{minWidth:0}}>
                 <h3>Recently added this session</h3>
-                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
+                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} onEditionsClick={showEditions} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
               </div>
             </>
           ) : (
@@ -2385,6 +2406,12 @@ export default function App(){
                   <option value="__none__">Standalone</option>
                 </select>
               </form>
+              {editionFilter && (
+                <div className="active-edition-filter">
+                  Showing editions of <strong>{editionFilter.title}</strong>
+                  <button type="button" onClick={()=>{ setEditionFilter(null); fetchBooks(undefined, undefined, {edition:null}) }}>Clear</button>
+                </div>
+              )}
               {!readOnly && books.length>0 && (
                 <div className="bulk-actions">
                   <span className="muted">Fill in the whole list from the catalogues:</span>
@@ -2403,7 +2430,7 @@ export default function App(){
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}
                          onRefreshAll={(books.length && !readOnly) ? refreshAllTags : null} refreshing={refreshing} />
               <div style={{margin:'8px 0',color:'#666',fontSize:13}}>{books.length} book{books.length===1?'':'s'}</div>
-              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} emptyText="No books match." />
+              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} onEditionsClick={showEditions} emptyText="No books match." />
             </div>
           )}
         </>
