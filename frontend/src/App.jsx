@@ -68,10 +68,15 @@ function seriesLabel(book){
   return `${name} (${n})`
 }
 
-function CopyCount({book}){
+function CopyCount({book, onClick}){
   const count = Number(book && book.copy_count) || 1
   if(count < 2) return null
-  return <span className="copy-count">{count} copies</span>
+  return (
+    <button type="button" className="copy-count" onClick={()=>onClick && onClick(book)}
+            title="Show all physical copies of this edition">
+      {count} copies
+    </button>
+  )
 }
 
 function EditionBadge({book, onClick}){
@@ -1698,7 +1703,7 @@ function CheckoutStatus({book, onCheckout, onCheckin, busy}){
   )
 }
 
-function CheckoutPanel({onBookPatched}){
+function CheckoutPanel({onBookPatched, onCopiesClick}){
   const readOnly = useReadOnly()
   const [books,setBooks] = useState([])
   const [q,setQ] = useState('')
@@ -1743,7 +1748,7 @@ function CheckoutPanel({onBookPatched}){
           <div className="checkout-book" key={book.id}>
             <CoverThumb book={book} width={42} />
             <div className="checkout-book-details">
-              <strong>{book.title} <CopyCount book={book} /></strong>
+              <strong>{book.title} <CopyCount book={book} onClick={onCopiesClick} /></strong>
               {book.author && <span>{book.author}</span>}
             </div>
             <CheckoutStatus book={book} onCheckin={readOnly ? undefined : checkin} busy={busy===book.id} />
@@ -1768,7 +1773,7 @@ function SortHeader({label, field, sort, onSort, className}){
   )
 }
 
-function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate, onSeriesClick, onEditionsClick}){
+function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, onSort, shelves, onPlace, onLocate, onSeriesClick, onEditionsClick, onCopiesClick}){
   const readOnly = useReadOnly()
   const [editingId, setEditingId] = useState(null)
   const [editVals, setEditVals] = useState({title:'', author:'', isbn:'', olid:'', googleId:'', notes:'', tags:'', format:'', series:'', seriesIndex:'', description:'', added:'', addedOriginal:''})
@@ -1908,7 +1913,7 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
               ) : (
                 <>
                   <td className="col-title">
-                    <span>{b.title}</span> <CopyCount book={b} />
+                    <span>{b.title}</span> <CopyCount book={b} onClick={onCopiesClick} />
                     <EditionBadge book={b} onClick={onEditionsClick} />
                   </td>
                   <td className="col-author"><AuthorCell author={b.author} /></td>
@@ -1984,6 +1989,7 @@ export default function App(){
   const [seriesFilter,setSeriesFilter]=useState('')
   const [seriesInUse,setSeriesInUse]=useState([])
   const [editionFilter,setEditionFilter]=useState(null)
+  const [copyFilter,setCopyFilter]=useState(null)
   const [tagMatch,setTagMatch]=useState('all')
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
@@ -2011,7 +2017,7 @@ export default function App(){
     const term = t(query===undefined ? q : query)
     const s = sortOverride || sort
     const f = {tags: selectedTags, excludes: excludedTags, match: tagMatch,
-               shelf: shelfFilter, edition: editionFilter, ...(filterOverride || {})}
+               shelf: shelfFilter, edition: editionFilter, copies: copyFilter, ...(filterOverride || {})}
     const fmt = f.format===undefined ? formatFilter : f.format
     const ser = f.series===undefined ? seriesFilter : f.series
     const params = [`sort=${s.field}`, `dir=${s.dir}`]
@@ -2034,6 +2040,7 @@ export default function App(){
     if(ser==='__none__') params.push('has_series=false')
     else if(ser) params.push('series=' + encodeURIComponent(ser))
     if(f.edition) params.push('edition_of=' + encodeURIComponent(f.edition.id))
+    if(f.copies) params.push('copies_of=' + encodeURIComponent(f.copies.id))
     const res = await fetch(API_BASE + '/books?' + params.join('&'), {headers: authHeaders()})
     if(res.status===401){ setLoggedIn(false); return }
     // The API already applied the ordering, so keep the response order as-is.
@@ -2107,7 +2114,8 @@ export default function App(){
     setShelfFilter('')
     setSeriesFilter(value)
     setEditionFilter(null)
-    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value, edition: null})
+    setCopyFilter(null)
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value, edition: null, copies: null})
   }
 
   const showEditions = (book)=>{
@@ -2119,7 +2127,21 @@ export default function App(){
     setShelfFilter('')
     setSeriesFilter('')
     setEditionFilter({id: book.id, title: book.title})
-    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', edition: {id: book.id}})
+    setCopyFilter(null)
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', edition: {id: book.id}, copies: null})
+  }
+
+  const showCopies = (book)=>{
+    setTab('manage')
+    setQ('')
+    setSelectedTags([])
+    setExcludedTags([])
+    setFormatFilter('')
+    setShelfFilter('')
+    setSeriesFilter('')
+    setEditionFilter(null)
+    setCopyFilter({id: book.id, title: book.title, count: book.copy_count})
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', edition: null, copies: {id: book.id}})
   }
 
   const clearTagFilter = ()=>{
@@ -2313,7 +2335,7 @@ export default function App(){
     fetchFormats()
   }
 
-  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setExcludedTags([]); setFormatFilter(''); setShelfFilter(''); setFormatsInUse([]); setEditionFilter(null) }
+  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setExcludedTags([]); setFormatFilter(''); setShelfFilter(''); setFormatsInUse([]); setEditionFilter(null); setCopyFilter(null) }
 
   return (
     <ReadOnlyContext.Provider value={readOnly}>
@@ -2371,13 +2393,13 @@ export default function App(){
               {!readOnly && <ShelvesPanel shelves={shelves} onChanged={async ()=>{ await fetchShelves(); await fetchBooks(); setLocationVersion(v=> v+1) }} />}
             </>
           ) : tab==='checkout' ? (
-            <CheckoutPanel onBookPatched={onBookPatched} />
+            <CheckoutPanel onBookPatched={onBookPatched} onCopiesClick={showCopies} />
           ) : (tab==='add' && !readOnly) ? (
             <>
               <AddForm onAdded={onAdded} />
               <div className="card" style={{minWidth:0}}>
                 <h3>Recently added this session</h3>
-                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} onEditionsClick={showEditions} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
+                <BooksTable books={recent} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} onEditionsClick={showEditions} onCopiesClick={showCopies} emptyText="Nothing added yet — books you add will appear here so you can edit them." />
               </div>
             </>
           ) : (
@@ -2412,6 +2434,12 @@ export default function App(){
                   <button type="button" onClick={()=>{ setEditionFilter(null); fetchBooks(undefined, undefined, {edition:null}) }}>Clear</button>
                 </div>
               )}
+              {copyFilter && (
+                <div className="active-edition-filter">
+                  Showing {copyFilter.count} copies of <strong>{copyFilter.title}</strong>
+                  <button type="button" onClick={()=>{ setCopyFilter(null); fetchBooks(undefined, undefined, {copies:null}) }}>Clear</button>
+                </div>
+              )}
               {!readOnly && books.length>0 && (
                 <div className="bulk-actions">
                   <span className="muted">Fill in the whole list from the catalogues:</span>
@@ -2430,7 +2458,7 @@ export default function App(){
                          onToggle={toggleTag} onMatchChange={changeTagMatch} onClear={clearTagFilter}
                          onRefreshAll={(books.length && !readOnly) ? refreshAllTags : null} refreshing={refreshing} />
               <div style={{margin:'8px 0',color:'#666',fontSize:13}}>{books.length} book{books.length===1?'':'s'}</div>
-              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} onEditionsClick={showEditions} emptyText="No books match." />
+              <BooksTable books={books} onDelete={handleDelete} onSaved={onSaved} onBookPatched={onBookPatched} sort={sort} onSort={toggleSort} shelves={shelves} onPlace={setPlacing} onLocate={setLocating} onSeriesClick={showSeries} onEditionsClick={showEditions} onCopiesClick={showCopies} emptyText="No books match." />
             </div>
           )}
         </>

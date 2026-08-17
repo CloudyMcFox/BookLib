@@ -1670,6 +1670,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
                series: Optional[str] = None, has_series: Optional[bool] = None,
                checked_out: Optional[bool] = None,
                edition_of: Optional[int] = None,
+               copies_of: Optional[int] = None,
                current_user: dict = Depends(get_current_user)):
     """List books. Optional ?q= search over title, author, ISBN, OLID, series
     and notes,
@@ -1730,6 +1731,23 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
             raise HTTPException(status_code=404, detail="Not found")
         where.append("id IN (" + ",".join("?" * len(edition_ids)) + ")")
         params.extend(edition_ids)
+
+    if copies_of is not None:
+        source = conn.execute("SELECT isbn FROM books WHERE id=?", (copies_of,)).fetchone()
+        if not source:
+            raise HTTPException(status_code=404, detail="Not found")
+        normalized_isbn = re.sub(r'[^0-9Xx]', '', source['isbn'] or '').lower()
+        if not normalized_isbn:
+            where.append("id = ?")
+            params.append(copies_of)
+        else:
+            copy_ids = [
+                row['id'] for row in conn.execute(
+                    "SELECT id, isbn FROM books WHERE isbn IS NOT NULL AND isbn <> ''").fetchall()
+                if re.sub(r'[^0-9Xx]', '', row['isbn']).lower() == normalized_isbn
+            ]
+            where.append("id IN (" + ",".join("?" * len(copy_ids)) + ")")
+            params.extend(copy_ids)
 
     wanted = normalize_tags((tags or '').split(','))
     if wanted:

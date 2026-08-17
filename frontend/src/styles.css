@@ -64,6 +64,7 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .books .col-notes{min-width:160px}
 .books .col-title{min-width:150px}
 .copy-count{display:inline-block;margin-left:4px;padding:1px 6px;border-radius:999px;background:#f3e8ff;border:1px solid #d8b4fe;color:#6b21a8;font-size:11px;font-weight:600;white-space:nowrap;vertical-align:middle}
+.copy-count:hover:not(:disabled){background:#e9d5ff}
 .edition-badge{display:block;margin-top:5px;padding:2px 7px;border-color:#bfdbfe;background:#eff6ff;color:#1d4ed8;font-size:11px}
 .edition-badge:hover:not(:disabled){background:#dbeafe}
 .active-edition-filter{display:flex;align-items:center;gap:6px;margin-top:8px;padding:6px 8px;border:1px solid #bfdbfe;border-radius:6px;background:#eff6ff;color:#1e3a8a;font-size:12px}

@@ -226,7 +226,8 @@ untouched. Dates are stored and displayed in UTC.
 `POST /books` returns `409` when its ISBN already exists. Repeat the request
 with `?allow_duplicate=true` after confirming that another physical copy should
 be added. Book responses include `copy_count`, and duplicate copies show that
-total beside the title in the library.
+total beside the title in the library. Clicking the count filters the library
+to those physical copies.
 
 Books with the same normalized title and author but different ISBNs show an
 **Other edition available** badge. Clicking it filters the library to those
