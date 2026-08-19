@@ -757,12 +757,13 @@ def normalize_tags(names) -> List[str]:
     return out
 
 
-def get_book_tags(book_id: Optional[int]) -> List[str]:
+def get_book_tags(book_id: Optional[int], db_conn=None) -> List[str]:
     if not book_id:
         return []
-    cur = conn.execute("""SELECT t.name FROM tags t
-                          JOIN book_tags bt ON bt.tag_id = t.id
-                          WHERE bt.book_id = ? ORDER BY t.name COLLATE NOCASE""", (book_id,))
+    db = db_conn or conn
+    cur = db.execute("""SELECT t.name FROM tags t
+                        JOIN book_tags bt ON bt.tag_id = t.id
+                        WHERE bt.book_id = ? ORDER BY t.name COLLATE NOCASE""", (book_id,))
     return [r['name'] for r in cur.fetchall()]
 
 
@@ -781,14 +782,16 @@ def tags_for_books(book_ids: List[int]) -> dict:
     return grouped
 
 
-def _tag_id(name: str) -> int:
-    conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (name,))
-    row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+def _tag_id(name: str, db_conn=None) -> int:
+    db = db_conn or conn
+    db.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (name,))
+    row = db.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
     return row['id']
 
 
-def prune_orphan_tags():
-    conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM book_tags)")
+def prune_orphan_tags(db_conn=None):
+    db = db_conn or conn
+    db.execute("DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM book_tags)")
 
 
 def set_book_tags(book_id: int, names) -> List[str]:
@@ -802,22 +805,24 @@ def set_book_tags(book_id: int, names) -> List[str]:
     return get_book_tags(book_id)
 
 
-def add_book_tags(book_id: int, names) -> List[str]:
+def add_book_tags(book_id: int, names, db_conn=None) -> List[str]:
     """Add tags to a book, keeping any it already has."""
-    existing = {t.lower() for t in get_book_tags(book_id)}
+    db = db_conn or conn
+    existing = {t.lower() for t in get_book_tags(book_id, db)}
     room = MAX_TAGS_PER_BOOK - len(existing)
     if room <= 0:
-        return get_book_tags(book_id)
+        return get_book_tags(book_id, db)
     for name in normalize_tags(names):
         if name.lower() in existing:
             continue
-        conn.execute("INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?,?)", (book_id, _tag_id(name)))
+        db.execute("INSERT OR IGNORE INTO book_tags (book_id, tag_id) VALUES (?,?)",
+                   (book_id, _tag_id(name, db)))
         existing.add(name.lower())
         room -= 1
         if room <= 0:
             break
-    conn.commit()
-    return get_book_tags(book_id)
+    db.commit()
+    return get_book_tags(book_id, db)
 
 
 # --- auth helpers ---
@@ -1559,16 +1564,19 @@ def _cover_candidates(isbn: Optional[str], olid: Optional[str], cover_url: Optio
 
 
 def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_url: Optional[str] = None,
-                 only_cover_url: bool = False, google_id: Optional[str] = None) -> bool:
+                 only_cover_url: bool = False, google_id: Optional[str] = None,
+                 db_conn=None) -> bool:
     """Best effort: find a cover for the book and save it in the database.
     OpenLibrary is tried first, then Google Books."""
+    db = db_conn or conn
     candidates = _cover_candidates(isbn, olid, cover_url, only_cover_url)
     for url in candidates:
         result = _download_image(url)
         if result:
             content, mime = result
-            conn.execute("UPDATE books SET cover=?, cover_mime=? WHERE id=?", (sqlite3.Binary(content), mime, book_id))
-            conn.commit()
+            db.execute("UPDATE books SET cover=?, cover_mime=? WHERE id=?",
+                       (sqlite3.Binary(content), mime, book_id))
+            db.commit()
             return True
 
     # An explicit address is a specific request; do not quietly substitute
@@ -1580,8 +1588,9 @@ def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_u
         result = _download_image(url)
         if result:
             content, mime = result
-            conn.execute("UPDATE books SET cover=?, cover_mime=? WHERE id=?", (sqlite3.Binary(content), mime, book_id))
-            conn.commit()
+            db.execute("UPDATE books SET cover=?, cover_mime=? WHERE id=?",
+                       (sqlite3.Binary(content), mime, book_id))
+            db.commit()
             return True
     return False
 
@@ -1589,36 +1598,34 @@ def _store_cover(book_id: int, isbn: Optional[str], olid: Optional[str], cover_u
 def _enrich_new_book(book_id: int, title: str, author: Optional[str],
                      isbn: Optional[str], olid: Optional[str],
                      google_id: Optional[str], cover_url: Optional[str],
-                     needs_format: bool, needs_series: bool,
+                     needs_series: bool,
                      needs_description: bool, needs_tags: bool):
     """Fill optional catalogue metadata after the create response is sent.
 
     External catalogues can take minutes when several requests hit their
     timeout. The physical book already exists at this point, so that work must
     not make the create request look like it failed."""
-    if needs_format:
-        found_format = _openlibrary_format(olid, isbn)
-        if found_format:
-            conn.execute("UPDATE books SET format=? WHERE id=?", (found_format, book_id))
-            conn.commit()
+    db = get_conn()
+    try:
+        if needs_series:
+            series, series_index = _fetch_series(olid, isbn, title, google_id)
+            if series:
+                db.execute("UPDATE books SET series=?, series_index=? WHERE id=?",
+                           (series, series_index, book_id))
+                db.commit()
 
-    if needs_series:
-        series, series_index = _fetch_series(olid, isbn, title, google_id)
-        if series:
-            conn.execute("UPDATE books SET series=?, series_index=? WHERE id=?",
-                         (series, series_index, book_id))
-            conn.commit()
+        if needs_description:
+            description = _fetch_description(olid, isbn, title, author, google_id)
+            if description:
+                db.execute("UPDATE books SET description=? WHERE id=?", (description, book_id))
+                db.commit()
 
-    if needs_description:
-        description = _fetch_description(olid, isbn, title, author, google_id)
-        if description:
-            conn.execute("UPDATE books SET description=? WHERE id=?", (description, book_id))
-            conn.commit()
+        _store_cover(book_id, isbn, olid, cover_url, google_id=google_id, db_conn=db)
 
-    _store_cover(book_id, isbn, olid, cover_url, google_id=google_id)
-
-    if needs_tags:
-        add_book_tags(book_id, _fetch_genres(olid, isbn, title, author, google_id))
+        if needs_tags:
+            add_book_tags(book_id, _fetch_genres(olid, isbn, title, author, google_id), db)
+    finally:
+        db.close()
 
 
 # --- routes ---
@@ -1956,10 +1963,9 @@ def add_book(b: Book, background_tasks: BackgroundTasks,
             })
     b.olid = clean_olid(b.olid)
     b.google_id = clean_google_id(b.google_id)
-    # Store what the caller already knows. Missing optional catalogue metadata
-    # is fetched after the response so a slow external service cannot make a
-    # successful local insert appear to fail.
-    b.format = clean_format(b.format)
+    # The format determines which physical edition is being added, so resolve it
+    # before returning. The slower non-edition metadata remains background work.
+    b.format = clean_format(b.format) or _openlibrary_format(b.olid, b.isbn)
     b.series = clean_series(b.series)
     b.series_index = clean_series_index(b.series_index)
     if b.series and b.series_index is None:
@@ -1994,8 +2000,7 @@ def add_book(b: Book, background_tasks: BackgroundTasks,
     add_other_edition_counts([b])
     background_tasks.add_task(
         _enrich_new_book, b.id, b.title, b.author, b.isbn, b.olid, b.google_id,
-        requested_cover, not bool(b.format), not bool(b.series),
-        not bool(b.description), not bool(supplied))
+        requested_cover, not bool(b.series), not bool(b.description), not bool(supplied))
     return b
 
 @app.get("/books/{book_id}", response_model=Book)

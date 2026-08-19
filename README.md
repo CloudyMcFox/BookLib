@@ -241,10 +241,10 @@ address, or **Upload** your own file. List responses never carry the image data 
 they return a `has_cover` flag, and the bytes are served on demand from
 `GET /books/{id}/cover`.
 
-Automatic format, series, description, cover and genre enrichment runs after a
-new book has been saved and returned to the client. Slow or unavailable public
-catalogues therefore do not delay the local add operation; reload the listing
-to see metadata that finished in the background.
+Format detection runs before a new book is returned so the chosen physical
+edition has its binding immediately. Series, description, cover and genre
+enrichment then runs in the background on an isolated database connection;
+reload the listing to see metadata that finished after the add response.
 
 Books have a dedicated `olid` column for the OpenLibrary edition id. It is filled
 in automatically when you add from search results and is optional everywhere
