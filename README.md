@@ -507,3 +507,7 @@ VITE_API_BASE=http://localhost:8882 npm run dev
 - Compose binds the frontend and backend to loopback. Put the frontend behind an
   HTTPS reverse proxy before exposing it to the Internet, and do not publish the
   plaintext backend port publicly.
+
+## License
+
+BookLib is available under the [MIT License](LICENSE).
