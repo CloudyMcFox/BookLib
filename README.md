@@ -38,42 +38,67 @@ anywhere Docker does — it was built to live on a Synology NAS.
 
 ## Quick start
 
+### Requirements
+
+- Docker Engine or Docker Desktop with Docker Compose v2
+- Python 3 available once to generate the signing secret
+- A reverse proxy with HTTPS before exposing BookLib outside your machine or
+  private network
+
 ```bash
-git clone https://github.com/<you>/booklib.git
-cd booklib
-cp .env.example .env          # then edit it — at minimum set SECRET_KEY
+git clone https://github.com/CloudyMcFox/BookLib.git
+cd BookLib
+cp .env.example .env
+mkdir -p data
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Copy the generated value into `SECRET_KEY` in `.env`. The backend deliberately
+refuses to start with an empty, short, or example signing key.
+
+Start the application:
+
+```bash
 docker compose up -d --build
 ```
 
 Create your first user (there is no public registration endpoint):
 
 ```bash
-docker compose exec -w /app backend python create_user.py alice s3cret
+docker compose exec backend python create_user.py alice
 ```
 
-Then open <http://localhost:3006> and log in.
+The script prompts for the password without putting it in your shell history.
+Then open <http://127.0.0.1:3006> and sign in.
+
+Confirm both the frontend and the proxied API are responding:
+
+```bash
+docker compose ps
+curl http://127.0.0.1:3006/health
+```
+
+The expected health response is `{"status":"ok"}`. If a container is not
+healthy, inspect it with `docker compose logs backend` or
+`docker compose logs frontend`.
 
 ## Managing users
 
 There is no public registration endpoint; accounts are managed with the scripts
-in `backend/`. They only need `sqlite3` (stdlib) and `passlib`, so you can run
-them straight on the host next to `books.db` or inside the container.
+in `backend/`. Running them in the container is recommended because it already
+has the correct dependencies and database path.
 
 ```bash
-# on the server, from the directory holding books.db
-sudo python3 create_user.py alice s3cret     # add a user
-sudo python3 list_users.py                   # list accounts
-sudo python3 change_password.py alice        # prompts twice, hidden
-sudo python3 change_password.py alice s3cret # or pass it inline
-
-# or inside the container
-docker compose exec -w /app backend python list_users.py
+docker compose exec backend python create_user.py alice
+docker compose exec backend python list_users.py
+docker compose exec backend python change_password.py alice
 ```
 
-`list_users.py` and `change_password.py` accept `--db PATH` (or the `BOOKLIB_DB`
-environment variable) when `books.db` is not in the current directory. Changing
-a password does not invalidate tokens that were already issued; those expire on
-their own after 8 hours.
+The create and password-change scripts prompt twice with hidden input. They also
+accept a password as an argument for automation, but doing so may save it in
+shell history. `BOOKLIB_DB` selects a different database when running the
+scripts outside Compose. Changing a password does not invalidate tokens already
+issued; those expire according to `ACCESS_TOKEN_EXPIRE_MINUTES`.
 
 ## Configuration
 
@@ -83,13 +108,14 @@ All settings live in `.env` (never committed — see `.env.example`).
 | ---------------- | -------------------------------------------------------------- |
 | `SECRET_KEY`     | Signs JWT access tokens. **Generate your own.**                 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default `480`, i.e. 8 hours)       |
-| `GUEST_ACCESS_ENABLED` | Set to `false` to remove guest browsing and checkout (default `true`) |
+| `GUEST_ACCESS_ENABLED` | Explicitly enable public guest browsing and checkout (default `false`) |
 | `GUEST_TOKEN_EXPIRE_MINUTES` | Guest session lifetime (default `120`)             |
 | `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
 | `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
 | `DEFAULT_SHELF_COLUMNS` / `DEFAULT_SHELF_ROWS` | Size of the shelf seeded on a new database (default `6` / `8`) |
-| `BACKEND_PORT`   | Host port for the API (default `8882`)                          |
-| `FRONTEND_PORT`  | Host port for the UI (default `3006`)                           |
+| `BACKEND_PORT`   | Loopback-only host port for API diagnostics (default `8882`)    |
+| `FRONTEND_PORT`  | Loopback-only host port for the UI (default `3006`)             |
+| `CORS_ORIGINS`   | Comma-separated origins allowed to call the API directly        |
 | `VITE_API_BASE`  | Backend URL baked into the frontend bundle at build time        |
 
 Generate a secret with:
@@ -100,61 +126,80 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 ### Pointing the frontend at the backend
 
-`VITE_API_BASE` is compiled into the JavaScript bundle, so **you must rebuild
-the frontend after changing it**:
+The default and recommended deployment is **same origin**. Leave
+`VITE_API_BASE` and `CORS_ORIGINS` empty, direct your HTTPS reverse proxy to
+`127.0.0.1:3006`, and let the frontend nginx container proxy API requests to the
+private backend service. The browser never needs direct access to port 8882.
+
+For example:
+
+```text
+https://books.example.com -> http://127.0.0.1:3006
+```
+
+Both published Compose ports bind to `127.0.0.1` by default. Do not change the
+backend binding to `0.0.0.0` on an Internet-facing host.
+
+If the frontend and API must use separate public origins, set
+`VITE_API_BASE=https://api.example.com` and
+`CORS_ORIGINS=https://books.example.com`. Put both origins behind HTTPS.
+`VITE_API_BASE` is compiled into the JavaScript bundle, so rebuild after
+changing it:
 
 ```bash
 docker compose build frontend && docker compose up -d frontend
 ```
 
-Two supported setups:
-
-1. **Separate hostname (recommended).** Give the API its own subdomain in your
-   reverse proxy (e.g. `api.example.com` → `backend:8882`, `books.example.com`
-   → `frontend:80`) and set `VITE_API_BASE=https://api.example.com`.
-2. **Same origin.** If your proxy serves both the UI and the API from one
-   hostname, leave `VITE_API_BASE` empty — the app then calls its own origin.
-
-Once you have a fixed public origin, tighten CORS in
-`backend/app/main.py` (`origins = ["*"]`) to just that domain.
+Never use a wildcard CORS origin with credentials. List only frontend origins
+you control.
 
 ## Data
 
-The library lives in a SQLite file at `backend/books.db`, bind mounted from the
-host so it survives rebuilds. It is gitignored. Back it up by copying the file.
+The library lives in `data/books.db`, mounted into the backend container as
+`/data/books.db`. The whole `data/` directory is gitignored and excluded from
+Docker build contexts, so database contents cannot be copied into an image
+layer.
 
-**The database sits inside the folder you deploy.** A plain "copy everything to
-the server" therefore overwrites the live library with whatever `books.db` is on
-your machine — and the same goes for `.env`. Use `deploy.ps1` rather than a raw
-copy:
-
-```powershell
-.\deploy.ps1 -Destination \\bookserver\srv\booklib -DryRun   # see what would move
-.\deploy.ps1 -Destination \\bookserver\srv\booklib           # copy the source
-.\deploy.ps1 -Destination \\bookserver\srv\booklib -Mirror   # also purge removed files
-```
-
-It excludes `books.db` (and its journal/WAL files), `.env`, `node_modules`,
-`dist`, `__pycache__` and `.git`. Excluded files are never copied *and never
-deleted*, so `-Mirror` cannot take out the live database. Both images build from
-source on the server, so the build artefacts do not need to travel.
-
-After copying, restart the stack so the backend reopens the database:
+For a simple consistent backup, briefly stop the backend before copying the
+database:
 
 ```bash
-docker compose up -d --build
+docker compose stop backend
+cp data/books.db /your/backup/location/books-$(date +%F).db
+docker compose start backend
 ```
 
-Restoring a backup needs the same restart — SQLite holds the old file handle
-open, so a file swapped underneath a running container is ignored until it
-restarts.
+Restore only while the backend is stopped, then start it again.
+
+### Updating an installation
+
+Back up `data/books.db`, then update from the repository:
+
+```bash
+git pull --ff-only
+docker compose up -d --build --remove-orphans
+docker compose ps
+curl http://127.0.0.1:3006/health
+```
+
+Compose replaces the application containers without changing `.env` or
+`data/`. Review the release notes and `.env.example` before each upgrade in case
+a release adds a configuration variable or a manual migration step.
+
+For Windows-to-server deployments, `deploy.ps1` copies source while preserving
+the destination's `.env` and `data/` directory:
+
+```powershell
+.\deploy.ps1 -Destination \\bookserver\srv\booklib -DryRun
+.\deploy.ps1 -Destination \\bookserver\srv\booklib
+```
 
 If the API returns `attempt to write a readonly database`, the file or its
 directory is not writable by the container user:
 
 ```bash
 docker compose exec -w / backend sh -c 'id -u; id -g'
-sudo chown -R <uid>:<gid> ./backend
+sudo chown -R <uid>:<gid> ./data
 ```
 
 ## CSV import
@@ -167,8 +212,8 @@ Each CSV row is imported as its own physical copy, even when ISBNs repeat.
 
 ## API
 
-All routes except `/health`, `/auth/config`, `/token` and `/token/guest` require an
-`Authorization: Bearer <token>` header.
+All routes except `/health`, `/auth/config`, `/token` and `/token/guest` require
+an OAuth2 bearer token in the `Authorization` request header.
 
 Tokens carry a role. Accounts made with `create_user.py` get `admin` and may do
 anything; a token from `/token/guest` gets `guest` and cannot edit the catalogue
@@ -189,7 +234,7 @@ or check books in. Guests may use the checkout route.
 | `POST`   | `/books/{id}/checkout` | Check out a book under a borrower name |
 | `POST`   | `/books/{id}/checkin` | Check a book back in (admin only)       |
 | `POST`   | `/books/import`   | Bulk import a CSV file                   |
-| `GET`    | `/books/{id}/cover` | Stored cover image (accepts `?token=`) |
+| `GET`    | `/books/{id}/cover` | Stored cover image                    |
 | `POST`   | `/books/{id}/cover` | Upload a cover image                   |
 | `POST`   | `/books/{id}/cover/lookup` | Find a cover on OpenLibrary   |
 | `DELETE` | `/books/{id}/cover` | Remove the stored cover                |
@@ -367,12 +412,15 @@ does not hit Google three times for the same ISBN.
 
 ### Diagnosing a book with missing tags
 
-Both diagnostic endpoints accept `?token=<jwt>` as well as an `Authorization`
-header, so you can paste the URL straight into a browser. Get a token with:
+Diagnostic endpoints are administrator-only. Obtain a token through the normal
+login endpoint, then send it in the `Authorization` header rather than putting
+it in the URL.
 
 ```bash
-curl -s -X POST http://localhost:8882/token \
-     -d 'username=YOURUSER&password=YOURPASS' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])'
+TOKEN=$(curl -s -X POST http://127.0.0.1:8882/token \
+  -d 'username=YOURUSER' \
+  --data-urlencode 'password=YOURPASSWORD' |
+  python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 ```
 
 `GET /diagnostics/{isbn}` reports what each catalogue actually holds and what the
@@ -380,8 +428,9 @@ genre extractor made of it, which separates "the source has nothing" from "we
 dropped it". Pass `?title=` and `?author=` to mirror what a real lookup would
 use when Google has not indexed the ISBN:
 
-```
-http://localhost:8882/diagnostics/9781668068168?title=Songs+of+the+Dead&author=Brandon+Sanderson&token=YOUR_TOKEN
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8882/diagnostics/9781668068168?title=Songs%20of%20the%20Dead&author=Brandon%20Sanderson"
 ```
 
 ```jsonc
@@ -430,7 +479,10 @@ Interactive docs are at `http://localhost:8882/docs`.
 # Backend
 cd backend
 pip install -r requirements.txt
-SECRET_KEY=dev uvicorn app.main:app --reload --port 8882
+SECRET_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')" \
+  BOOKLIB_DB=/tmp/booklib-dev.db \
+  CORS_ORIGINS=http://localhost:5173 \
+  uvicorn app.main:app --reload --port 8882
 
 # Frontend
 cd frontend
@@ -440,11 +492,22 @@ VITE_API_BASE=http://localhost:8882 npm run dev
 
 ## Security notes
 
-- `.env` and `backend/books.db` are gitignored — keep it that way.
+- `.env` and `data/` are gitignored and excluded from Docker builds.
+- The backend refuses to start without a strong, non-example `SECRET_KEY`.
 - Back up `SECRET_KEY`; changing it invalidates every issued token.
 - There is no public registration; users are created with `create_user.py`.
-- The guest login needs no password, so anyone who can reach the app can read the
-  library and check books out under any name. Only administrators can check
-  books back in. Set
-  `GUEST_ACCESS_ENABLED=false` if that is not what you want.
-- Put the app behind HTTPS before exposing it to the internet.
+- Guest access is disabled by default. Enabling it allows anyone who can reach
+  the application to browse public catalogue fields and check out available
+  books under a supplied name. Private notes, borrower identities, checkout
+  timestamps, and shelf locations are not returned to guests.
+- Stored covers require an authorization header; access tokens are never placed
+  in image URLs.
+- Cover lookup URLs are restricted to HTTPS images from OpenLibrary and Google
+  Books. Upload other cover files directly.
+- Compose binds the frontend and backend to loopback. Put the frontend behind an
+  HTTPS reverse proxy before exposing it to the Internet, and do not publish the
+  plaintext backend port publicly.
+
+## License
+
+BookLib is available under the [MIT License](LICENSE).

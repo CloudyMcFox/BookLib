@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, BackgroundTasks
 from fastapi.responses import Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -11,20 +11,30 @@ from datetime import datetime, timedelta
 import csv
 import io
 import re
+from urllib.parse import urljoin, urlparse
 from fastapi.middleware.cors import CORSMiddleware
 
 # DB and auth config
 import os
-DB_PATH = "books.db"
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-to-a-secure-random-string")
+DB_PATH = os.environ.get("BOOKLIB_DB", "books.db")
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+_INSECURE_SECRET_KEYS = {
+    "",
+    "change-me-to-a-secure-random-string",
+    "replace-with-a-long-random-string",
+}
+if SECRET_KEY in _INSECURE_SECRET_KEYS or len(SECRET_KEY) < 32:
+    raise RuntimeError(
+        "SECRET_KEY must be set to a unique random value of at least 32 characters"
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 60 * 8))
 
 # Guest access: anyone can browse and use circulation without an account.
 # Guests are not rows in users, they are only a claim in the token, so there is
 # no password to leak and nothing to keep in sync. Set
-# GUEST_ACCESS_ENABLED=false to turn the door off entirely.
-GUEST_ACCESS_ENABLED = os.environ.get("GUEST_ACCESS_ENABLED", "true").strip().lower() not in ("0", "false", "no")
+# GUEST_ACCESS_ENABLED=true to opt in explicitly.
+GUEST_ACCESS_ENABLED = os.environ.get("GUEST_ACCESS_ENABLED", "false").strip().lower() not in ("0", "false", "no")
 GUEST_USERNAME = "guest"
 ROLE_GUEST = "guest"
 ROLE_ADMIN = "admin"
@@ -56,15 +66,19 @@ def get_conn():
 
 app = FastAPI(title="Book Library API")
 
-# Allow cross-origin requests from the frontend. For production, restrict origins to your NAS host.
-origins = ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_origins = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 def clean(value: Optional[str]) -> Optional[str]:
     """Strip surrounding whitespace; empty strings become NULL so the unique
@@ -303,6 +317,7 @@ class Book(BaseModel):
     # values are null while the book is available.
     borrower_name: Optional[str] = None
     checked_out_at: Optional[str] = None
+    checked_out: bool = False
     # Total physical copies carrying this ISBN, including copies outside the
     # current filtered listing.
     copy_count: int = 1
@@ -320,7 +335,22 @@ def book_from_row(row, tags: Optional[List[str]] = None) -> Book:
     d.pop('cover_mime', None)
     book = Book(**d)
     book.tags = tags if tags is not None else get_book_tags(book.id)
+    book.checked_out = book.checked_out_at is not None
     return book
+
+
+def book_for_user(book: Book, current_user: dict) -> Book:
+    """Guests get catalogue data and availability, never private owner data."""
+    if not is_guest(current_user):
+        return book
+    return book.copy(update={
+        "notes": None,
+        "shelf_id": None,
+        "shelf_column": None,
+        "shelf_row": None,
+        "borrower_name": None,
+        "checked_out_at": None,
+    })
 
 class Token(BaseModel):
     access_token: str
@@ -891,29 +921,53 @@ def _user_from_token(token: str):
     return {**user, "role": ROLE_ADMIN}
 
 
-async def get_current_user_flexible(request: Request, token: Optional[str] = None):
-    """Same as get_current_user but also accepts ?token=... so plain <img>
-    tags (which cannot send an Authorization header) can load covers."""
-    header = request.headers.get('Authorization') or ''
-    raw = header[7:].strip() if header.lower().startswith('bearer ') else (token or '')
-    if not raw:
-        raise HTTPException(status_code=401, detail="Could not validate credentials")
-    return _user_from_token(raw)
-
-
 # --- cover helpers ---
 COVERS_BASE = "https://covers.openlibrary.org/b"
 MAX_COVER_BYTES = 5 * 1024 * 1024
 # OpenLibrary returns a 1x1 blank gif when it has no cover, so ignore tiny bodies.
 MIN_COVER_BYTES = 1000
+ALLOWED_COVER_HOSTS = {
+    "books.google.com",
+    "books.googleusercontent.com",
+    "covers.openlibrary.org",
+}
+
+
+def _is_allowed_cover_url(url: str) -> bool:
+    """Only fetch covers from the catalogue providers the application uses."""
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and parsed.username is None
+        and parsed.password is None
+        and port in (None, 443)
+        and any(host == allowed or host.endswith("." + allowed)
+                for allowed in ALLOWED_COVER_HOSTS)
+    )
 
 
 def _download_image(url: str) -> Optional[tuple]:
     """Download an image and return (bytes, mime), or None when unusable."""
+    if not _is_allowed_cover_url(url):
+        return None
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(url, timeout=10, allow_redirects=False)
     except requests.RequestException:
         return None
+    if 300 <= r.status_code < 400:
+        redirected = r.headers.get("Location")
+        redirected = urljoin(url, redirected) if redirected else None
+        if not redirected or not _is_allowed_cover_url(redirected):
+            return None
+        try:
+            r = requests.get(redirected, timeout=10, allow_redirects=False)
+        except requests.RequestException:
+            return None
     if r.status_code != 200:
         return None
     content = r.content or b''
@@ -1693,17 +1747,21 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     params: List = []
     if q:
         pattern = f"%{q.strip()}%"
-        # Notes included: it is where "signed", "lent to Sam" and "second copy"
-        # live, which are exactly the things you go looking for and cannot find
-        # by title.
-        where.append("(title LIKE ? OR author LIKE ? OR isbn LIKE ? OR olid LIKE ? OR notes LIKE ? OR series LIKE ?)")
-        params.extend([pattern] * 6)
+        searchable = ["title", "author", "isbn", "olid", "series"]
+        if not is_guest(current_user):
+            searchable.append("notes")
+        where.append("(" + " OR ".join(f"{column} LIKE ?" for column in searchable) + ")")
+        params.extend([pattern] * len(searchable))
 
     if shelf_id is not None:
+        if is_guest(current_user):
+            raise HTTPException(status_code=403, detail="Shelf locations are private")
         where.append("shelf_id = ?")
         params.append(shelf_id)
 
     if placed is not None:
+        if is_guest(current_user):
+            raise HTTPException(status_code=403, detail="Shelf locations are private")
         where.append("shelf_id IS NOT NULL" if placed else "shelf_id IS NULL")
 
     # Compared through clean_format so asking for "pbk." finds the Paperbacks,
@@ -1782,11 +1840,12 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         sql += " WHERE " + " AND ".join(where)
     rows = conn.execute(sql + order, params).fetchall()
     grouped = tags_for_books([r['id'] for r in rows])
-    return add_other_edition_counts(
+    books = add_other_edition_counts(
         [book_from_row(r, grouped.get(r['id'], [])) for r in rows])
+    return [book_for_user(book, current_user) for book in books]
 
 @app.get("/shelves", response_model=List[Shelf])
-def list_shelves(current_user: dict = Depends(get_current_user)):
+def list_shelves(current_user: dict = Depends(require_editor)):
     counts = {r['shelf_id']: r['n'] for r in conn.execute(
         "SELECT shelf_id, COUNT(*) AS n FROM books WHERE shelf_id IS NOT NULL GROUP BY shelf_id")}
     rows = conn.execute("SELECT * FROM shelves ORDER BY sort_order, id").fetchall()
@@ -1849,7 +1908,7 @@ def delete_shelf(shelf_id: int, current_user: dict = Depends(require_editor)):
 
 
 @app.get("/shelves/{shelf_id}/layout", response_model=ShelfLayout)
-def shelf_layout(shelf_id: int, current_user: dict = Depends(get_current_user)):
+def shelf_layout(shelf_id: int, current_user: dict = Depends(require_editor)):
     """A shelf plus what is currently in each slot, for drawing the picker."""
     shelf = get_shelf(shelf_id)
     if not shelf:
@@ -2009,7 +2068,7 @@ def get_book(book_id: int, current_user: dict = Depends(get_current_user)):
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
-    return book_from_row(row)
+    return book_for_user(book_from_row(row), current_user)
 
 
 @app.post("/books/{book_id}/checkout", response_model=Book)
@@ -2033,7 +2092,7 @@ def checkout_book(book_id: int, checkout: CheckoutRequest,
             raise HTTPException(status_code=404, detail="Not found")
         raise HTTPException(status_code=409, detail="This book is already checked out")
     row = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,)).fetchone()
-    return book_from_row(row)
+    return book_for_user(book_from_row(row), current_user)
 
 
 @app.post("/books/{book_id}/checkin", response_model=Book)
@@ -2054,8 +2113,8 @@ def checkin_book(book_id: int, current_user: dict = Depends(require_editor)):
 
 
 @app.get("/books/{book_id}/cover")
-def get_book_cover(book_id: int, current_user: dict = Depends(get_current_user_flexible)):
-    """Serve the stored cover image. Accepts ?token=... so <img> can use it."""
+def get_book_cover(book_id: int, current_user: dict = Depends(get_current_user)):
+    """Serve a stored cover to an authenticated client."""
     cur = conn.execute("SELECT cover, cover_mime FROM books WHERE id=?", (book_id,))
     row = cur.fetchone()
     if not row or not row['cover']:
@@ -2075,7 +2134,10 @@ def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_use
     supplied = clean(cover_url)
     if not _store_cover(book_id, row['isbn'], row['olid'], supplied, only_cover_url=bool(supplied), google_id=row['google_id']):
         if supplied:
-            raise HTTPException(status_code=400, detail="That address did not return a usable image. It needs to be a direct link to an image file under 5 MB.")
+            raise HTTPException(
+                status_code=400,
+                detail="That address must be an HTTPS image under 5 MB from OpenLibrary or Google Books. Upload other images directly.",
+            )
         raise HTTPException(status_code=404, detail="No cover found for this book on OpenLibrary or Google Books")
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone())
@@ -2747,7 +2809,7 @@ def lookup_isbn(isbn: str, current_user: dict = Depends(get_current_user)):
 @app.get("/diagnostics/search")
 def diagnose_search(title: Optional[str] = None, author: Optional[str] = None,
                     q: Optional[str] = None,
-                    current_user: dict = Depends(get_current_user_flexible)):
+                    current_user: dict = Depends(require_editor)):
     """Show the exact Google Books queries a search would run and what each one
     returns, so a missing book can be traced to the query rather than guessed at.
 
@@ -2787,7 +2849,7 @@ def diagnose_search(title: Optional[str] = None, author: Optional[str] = None,
 
 @app.get("/diagnostics/{isbn}")
 def diagnose_sources(isbn: str, title: Optional[str] = None, author: Optional[str] = None,
-                     current_user: dict = Depends(get_current_user_flexible)):
+                     current_user: dict = Depends(require_editor)):
     """Show what each catalogue actually holds for an ISBN, and what the genre
     extractor makes of it. Useful when a book comes back with fewer tags than
     expected — it separates "the source has nothing" from "we dropped it"."""
