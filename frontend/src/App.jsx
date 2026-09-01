@@ -144,6 +144,43 @@ function authHeaders(json){
   return h
 }
 
+function AuthenticatedCover({book, cacheBust=0, className, style, alt='' }){
+  const [src,setSrc]=useState(null)
+
+  useEffect(()=>{
+    let cancelled = false
+    let objectUrl = null
+    const controller = new AbortController()
+    setSrc(null)
+    ;(async ()=>{
+      try{
+        const res = await fetch(
+          `${API_BASE}/books/${book.id}/cover?v=${encodeURIComponent(cacheBust)}`,
+          {headers: authHeaders(), signal: controller.signal})
+        if(!res.ok) return
+        const loadedUrl = URL.createObjectURL(await res.blob())
+        if(cancelled){
+          URL.revokeObjectURL(loadedUrl)
+          return
+        }
+        objectUrl = loadedUrl
+        setSrc(loadedUrl)
+      }catch(_){ /* the empty cover state is enough */ }
+    })()
+    return ()=>{
+      cancelled = true
+      controller.abort()
+      if(objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [book.id, cacheBust])
+
+  return src
+    ? <img className={className} style={style} src={src} alt={alt} />
+    : <div className={`${className || ''} cover-thumb-empty`} style={style}>No cover</div>
+}
+
+const isCheckedOut = book => !!(book && (book.checked_out || book.checked_out_at))
+
 async function checkoutBook(book){
   const entered = prompt(`Who is checking out "${book.title}"?`)
   if(entered===null) return null
@@ -167,13 +204,6 @@ async function checkinBook(book){
 // books in, but the dedicated checkout endpoint lets them borrow books.
 const ReadOnlyContext = createContext(false)
 const useReadOnly = ()=> useContext(ReadOnlyContext)
-
-// <img> cannot send an Authorization header, so the token rides along in the query
-// string. cacheBust changes whenever a cover is replaced so the browser refetches.
-function coverUrl(book, cacheBust){
-  const token = localStorage.getItem('token') || ''
-  return `${API_BASE}/books/${book.id}/cover?token=${encodeURIComponent(token)}&v=${cacheBust||0}`
-}
 
 function Login({onLogin}){
   const [username,setUsername]=useState('')
@@ -504,7 +534,8 @@ function CoverCell({book, onChanged, onError}){
   return (
     <div className="cover-cell">
       {book.has_cover
-        ? <img className="cover-thumb" src={coverUrl(book, version)} alt={`Cover of ${book.title}`} />
+        ? <AuthenticatedCover book={book} cacheBust={version}
+                              className="cover-thumb" alt={`Cover of ${book.title}`} />
         : <div className="cover-thumb cover-thumb-empty">No cover</div>}
       <div className="cover-actions">
         {!readOnly && <>
@@ -1273,7 +1304,8 @@ function CoverThumb({book, width=34}){
   if(!book.has_cover){
     return <div className="cover-thumb cover-thumb-empty" style={{width, height, fontSize:9}}>—</div>
   }
-  return <img className="cover-thumb" style={{width, height}} src={coverUrl(book, 0)} alt="" />
+  return <AuthenticatedCover book={book} className="cover-thumb"
+                             style={{width, height, fontSize:9}} />
 }
 
 /// Browse a shelf: see it drawn, click a slot to see what is in it.
@@ -1685,7 +1717,7 @@ function AuthorCell({author}){
 }
 
 function CheckoutStatus({book, onCheckout, onCheckin, busy}){
-  if(!book.checked_out_at){
+  if(!isCheckedOut(book)){
     return (
       <div className="checkout-status">
         <span className="available">Available</span>
@@ -1696,8 +1728,8 @@ function CheckoutStatus({book, onCheckout, onCheckin, busy}){
   return (
     <div className="checkout-status checked-out">
       <strong>Checked out</strong>
-      <span>{book.borrower_name}</span>
-      <span>{formatCheckout(book.checked_out_at)}</span>
+      {book.borrower_name && <span>{book.borrower_name}</span>}
+      {book.checked_out_at && <span>{formatCheckout(book.checked_out_at)}</span>}
       {onCheckin && <button type="button" onClick={()=>onCheckin(book)} disabled={busy}>Check in</button>}
     </div>
   )
@@ -1738,7 +1770,8 @@ function CheckoutPanel({onBookPatched, onCopiesClick}){
     <div className="card checkout-panel">
       <h3>Checked out books</h3>
       <form className="search-row" onSubmit={e=>{ e.preventDefault(); load() }}>
-        <input placeholder="Search title, author, notes or ISBN" value={q} onChange={e=>setQ(e.target.value)} />
+        <input placeholder={readOnly ? 'Search title, author or ISBN' : 'Search title, author, notes or ISBN'}
+               value={q} onChange={e=>setQ(e.target.value)} />
         <button type="submit">Search</button>
         <button type="button" onClick={()=>{ setQ(''); load('') }}>Clear</button>
       </form>
@@ -1974,6 +2007,7 @@ export default function App(){
   // null until /me answers. Assuming either way would flash the wrong UI.
   const [me,setMe]=useState(null)
   const [meError,setMeError]=useState(null)
+  const [libraryError,setLibraryError]=useState(null)
   const [undo,setUndo]=useState(null)
   const [undoTimer,setUndoTimer]=useState(null)
   const [sort,setSort]=useState({field:'added', dir:'desc'})
@@ -1994,7 +2028,7 @@ export default function App(){
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
   const [placing,setPlacing]=useState(null)
-  // The book whose shelf position is being shown. Read-only, so guests get it.
+  // The book whose private shelf position is being shown.
   const [locating,setLocating]=useState(null)
   // Bumped whenever a location changes, so the bookshelf browser refetches.
   const [locationVersion,setLocationVersion]=useState(0)
@@ -2043,8 +2077,13 @@ export default function App(){
     if(f.copies) params.push('copies_of=' + encodeURIComponent(f.copies.id))
     const res = await fetch(API_BASE + '/books?' + params.join('&'), {headers: authHeaders()})
     if(res.status===401){ setLoggedIn(false); return }
+    if(!res.ok){
+      setLibraryError(await readError(res))
+      return
+    }
     // The API already applied the ordering, so keep the response order as-is.
     setBooks(await res.json())
+    setLibraryError(null)
   }
 
   const toggleSort = (field)=>{
@@ -2231,12 +2270,30 @@ export default function App(){
     loadMe()
   }, [loggedIn])
 
-  // Guests have no Add tab, so send them somewhere that exists.
+  // Guests have neither catalogue editing nor access to private shelf locations.
   useEffect(()=>{
-    if(readOnly && tab==='add'){ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() }
+    if(readOnly && (tab==='add' || tab==='shelves')){
+      setTab('manage')
+      setShelves([])
+      setShelfFilter('')
+      setPlacing(null)
+      setLocating(null)
+      fetchBooks()
+      fetchTags()
+      fetchFormats()
+      fetchSeries()
+    }
   }, [readOnly])
 
-  useEffect(()=>{ if(loggedIn){ fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() } }, [loggedIn])
+  useEffect(()=>{
+    if(loggedIn){
+      fetchBooks()
+      fetchTags()
+      if(!readOnly) fetchShelves()
+      fetchFormats()
+      fetchSeries()
+    }
+  }, [loggedIn, readOnly])
 
   // If an administrator deletes the shelf currently being filtered, return to
   // all shelves instead of leaving the Manage tab stuck on an impossible id.
@@ -2382,7 +2439,7 @@ export default function App(){
             {!readOnly && <button className={tab==='add'? 'tab active':'tab'} onClick={()=>setTab('add')}>Add</button>}
             <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() }}>{readOnly ? 'Browse' : 'Manage'}</button>
             <button className={tab==='checkout'? 'tab active':'tab'} onClick={()=>setTab('checkout')}>Checkout</button>
-            <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>
+            {!readOnly && <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>}
           </div>
 
           {tab==='shelves' ? (
@@ -2406,7 +2463,8 @@ export default function App(){
             <div className="card" style={{minWidth:0}}>
               <h3>{readOnly ? 'Browse library' : 'Manage library'}</h3>
               <form className="search-row" onSubmit={e=>{ e.preventDefault(); fetchBooks() }}>
-                <input placeholder="Search title, author, notes or ISBN" value={q} onChange={e=>setQ(e.target.value)} />
+                <input placeholder={readOnly ? 'Search title, author or ISBN' : 'Search title, author, notes or ISBN'}
+                       value={q} onChange={e=>setQ(e.target.value)} />
                 <button type="submit">Search</button>
                 <button type="button" onClick={()=>{ setQ(''); fetchBooks('') }}>Clear</button>
                 <select value={formatFilter} onChange={e=>changeFormatFilter(e.target.value)}
@@ -2415,12 +2473,14 @@ export default function App(){
                   {formatsInUse.map(f=> <option key={f} value={f}>{f}</option>)}
                   <option value="__none__">No format</option>
                 </select>
-                <select value={shelfFilter} onChange={e=>changeShelfFilter(e.target.value)}
-                        title="Show books on one shelf">
-                  <option value="">Any shelf</option>
-                  {shelves.map(s=> <option key={s.id} value={String(s.id)}>{s.name}</option>)}
-                  <option value="__unplaced__">Not placed</option>
-                </select>
+                {!readOnly && (
+                  <select value={shelfFilter} onChange={e=>changeShelfFilter(e.target.value)}
+                          title="Show books on one shelf">
+                    <option value="">Any shelf</option>
+                    {shelves.map(s=> <option key={s.id} value={String(s.id)}>{s.name}</option>)}
+                    <option value="__unplaced__">Not placed</option>
+                  </select>
+                )}
                 <select value={seriesFilter} onChange={e=>changeSeriesFilter(e.target.value)}
                         title="Show one series">
                   <option value="">Any series</option>
@@ -2428,6 +2488,7 @@ export default function App(){
                   <option value="__none__">Standalone</option>
                 </select>
               </form>
+              {libraryError && <div className="alert">{libraryError}</div>}
               {editionFilter && (
                 <div className="active-edition-filter">
                   Showing editions of <strong>{editionFilter.title}</strong>

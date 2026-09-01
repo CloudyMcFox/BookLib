@@ -3,10 +3,10 @@
     Copy the BookLib source tree to the server without touching live data.
 
 .DESCRIPTION
-    Wraps robocopy with a fixed exclusion list. The database and .env live in the
-    same folders as the code, so a plain "copy everything" overwrites the running
-    library and its secrets. Everything listed in $ExcludedFiles / $ExcludedDirs
-    is never copied and never deleted, so whatever is on the server stays put.
+    Wraps robocopy with a fixed exclusion list. The data directory and .env stay
+    on the server, so a source deployment cannot overwrite the running library
+    or its secrets. Everything listed in $ExcludedFiles / $ExcludedDirs is never
+    copied and never deleted, so whatever is on the server stays put.
 
     Both images build from source (backend installs requirements.txt, frontend
     runs npm ci + npm run build), so node_modules and dist are not copied either.
@@ -54,6 +54,7 @@ $ExcludedFiles = @(
 # Build artefacts and local tooling: rebuilt on the server, and node_modules
 # would carry Windows binaries onto a Linux host.
 $ExcludedDirs = @(
+    'data',
     'node_modules', 'dist', '.vite',
     '__pycache__', '.venv', 'venv',
     '.git', '.vscode', '.idea'
@@ -88,7 +89,7 @@ if ($code -ge 8) {
 Write-Host ""
 Write-Host "Done (robocopy code $code)." -ForegroundColor Green
 if (-not $DryRun) {
-    Write-Host "The server's books.db and .env were left untouched."
+    Write-Host "The server's data directory and .env were left untouched."
     Write-Host "Now restart the stack on the server: docker compose up -d --build"
 }
 exit 0
