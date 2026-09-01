@@ -173,25 +173,18 @@ Restore only while the backend is stopped, then start it again.
 
 ### Updating an installation
 
+Back up `data/books.db`, then update from the repository:
+
 ```bash
-docker compose stop backend
 git pull --ff-only
-mkdir -p data
-if [ -f backend/books.db ] && [ ! -f data/books.db ]; then
-  cp backend/books.db data/books.db
-fi
-docker compose up -d --build
+docker compose up -d --build --remove-orphans
+docker compose ps
+curl http://127.0.0.1:3006/health
 ```
 
-Stopping the old backend makes the one-time database migration consistent. Keep
-`backend/books.db` until the updated application starts and shows the expected
-library. Compose rebuilds the images without changing `.env` or `data/`.
-
-Before starting an installation created from an older `.env.example`, also:
-
-- Set `GUEST_ACCESS_ENABLED=false` unless anonymous browsing and checkout are
-  intentionally public.
-- Replace any missing or example `SECRET_KEY` with a newly generated value.
+Compose replaces the application containers without changing `.env` or
+`data/`. Review the release notes and `.env.example` before each upgrade in case
+a release adds a configuration variable or a manual migration step.
 
 For Windows-to-server deployments, `deploy.ps1` copies source while preserving
 the destination's `.env` and `data/` directory:
