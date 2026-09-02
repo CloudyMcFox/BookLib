@@ -1,0 +1,59 @@
+name: Bug report
+description: Report reproducible incorrect behavior in BookLib.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include passwords, access tokens, API keys, database contents, private server addresses, or borrower information.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The release version, image tag, or commit where the problem occurs.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Docker or deployment
+        - Backend API
+        - Web frontend
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Problem
+      description: Describe what happened and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start BookLib with...
+        2. Open...
+        3. Select...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the host OS, Docker and Compose versions, browser, and relevant non-secret configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Remove tokens, credentials, private URLs, library data, and borrower information.
+      render: shell
