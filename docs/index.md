@@ -15,4 +15,5 @@ it directly to a BookLib server that you or your server administrator operates.
 
 - [Privacy Policy](privacy/)
 - [Support](support/)
+- [App Clip QR links](app-clip/)
 - [BookLib server source and setup](https://github.com/CloudyMcFox/BookLib)

@@ -226,6 +226,7 @@ or check books in. Guests may use the checkout route.
 | `POST`   | `/token/guest`    | Get a browse/checkout guest JWT, no credentials |
 | `GET`    | `/auth/config`    | Whether guest access is enabled          |
 | `GET`    | `/me`             | Caller's username, role and `read_only` flag |
+| `GET`    | `/guest-checkout/isbn/{isbn}` | Exact ISBN summary and availability for App Clip checkout |
 | `GET`    | `/books`          | List books, optional search, sorting, catalogue filters, and `?checked_out=true|false` |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
@@ -507,6 +508,14 @@ VITE_API_BASE=http://localhost:8882 npm run dev
 - Compose binds the frontend and backend to loopback. Put the frontend behind an
   HTTPS reverse proxy before exposing it to the Internet, and do not publish the
   plaintext backend port publicly.
+
+## App Clip invocation service
+
+`infrastructure/app-clip-worker.js` is the stateless Cloudflare Worker used by
+the BookLib App Clip invocation domain. It serves Apple's association file and
+a browser fallback that confirms the destination before opening a self-hosted
+server. Deployment and QR URL details are available on the
+[App Clip documentation page](https://cloudymcfox.github.io/BookLib/app-clip/).
 
 ## License
 

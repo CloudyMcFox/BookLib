@@ -390,6 +390,61 @@ class UserCreate(BaseModel):
 class CheckoutRequest(BaseModel):
     borrower_name: str
 
+
+class GuestCheckoutLookup(BaseModel):
+    isbn: str
+    title: str
+    author: Optional[str] = None
+    available_count: int
+    total_count: int
+    book_id: Optional[int] = None
+
+
+def isbn_equivalents(value: str) -> set[str]:
+    """Return normalized ISBN-10/13 forms when a conversion is possible."""
+    normalized = re.sub(r"[^0-9Xx]", "", value).upper()
+    if len(normalized) == 10:
+        if not normalized[:9].isdigit() or not (
+            normalized[9].isdigit() or normalized[9] == "X"
+        ):
+            return set()
+        digits = [int(digit) for digit in normalized[:9]]
+        digits.append(10 if normalized[9] == "X" else int(normalized[9]))
+        if sum((10 - index) * digit
+               for index, digit in enumerate(digits)) % 11 != 0:
+            return set()
+    elif len(normalized) == 13:
+        if not normalized.isdigit():
+            return set()
+        expected = (10 - sum(
+            int(digit) * (1 if index % 2 == 0 else 3)
+            for index, digit in enumerate(normalized[:12])
+        ) % 10) % 10
+        if int(normalized[12]) != expected:
+            return set()
+    else:
+        return set()
+
+    equivalents = {normalized}
+
+    if len(normalized) == 10:
+        body = "978" + normalized[:9]
+        total = sum(
+            int(digit) * (1 if index % 2 == 0 else 3)
+            for index, digit in enumerate(body)
+        )
+        equivalents.add(body + str((10 - total % 10) % 10))
+
+    if len(normalized) == 13 and normalized.startswith("978"):
+        body = normalized[3:12]
+        total = sum((10 - index) * int(digit)
+                    for index, digit in enumerate(body))
+        check = (11 - total % 11) % 11
+        equivalents.add(body + ("X" if check == 10 else str(check)))
+
+    return equivalents
+
+
 # initialize DB
 conn = get_conn()
 conn.execute("""CREATE TABLE IF NOT EXISTS books (
@@ -1720,6 +1775,40 @@ def read_me(current_user: dict = Depends(get_current_user)):
         "role": current_user.get('role', ROLE_ADMIN),
         "read_only": is_guest(current_user),
     }
+
+
+@app.get("/guest-checkout/isbn/{isbn}", response_model=GuestCheckoutLookup)
+def guest_checkout_lookup(isbn: str,
+                          current_user: dict = Depends(get_current_user)):
+    """Find an exact ISBN and one available physical copy for quick checkout."""
+    equivalents = isbn_equivalents(isbn)
+    if not equivalents:
+        raise HTTPException(status_code=400, detail="ISBN must contain 10 or 13 digits")
+    normalized = re.sub(r"[^0-9Xx]", "", isbn).upper()
+
+    rows = conn.execute(
+        """SELECT id, title, author, isbn, checked_out_at
+           FROM books
+           WHERE isbn IS NOT NULL AND TRIM(isbn) <> ''
+           ORDER BY id"""
+    ).fetchall()
+    matches = [
+        row for row in rows
+        if re.sub(r"[^0-9Xx]", "", row["isbn"] or "").upper() in equivalents
+    ]
+    if not matches:
+        raise HTTPException(status_code=404, detail="This book is not in this library")
+
+    available = [row for row in matches if row["checked_out_at"] is None]
+    representative = available[0] if available else matches[0]
+    return GuestCheckoutLookup(
+        isbn=normalized,
+        title=representative["title"],
+        author=representative["author"],
+        available_count=len(available),
+        total_count=len(matches),
+        book_id=available[0]["id"] if available else None,
+    )
 
 
 @app.get("/books", response_model=List[Book])
