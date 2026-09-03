@@ -5,7 +5,6 @@
 
 # Database / data
 data/
-review-data/
 *.db
 *.db-journal
 *.db-shm
