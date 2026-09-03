@@ -1,0 +1,23 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "127.0.0.1:${REVIEW_BACKEND_PORT:-8889}:8882"
+    volumes:
+      - ./review-data:/data
+    env_file:
+      - .env.review
+    environment:
+      BOOKLIB_DB: /data/books.db
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: ""
+    ports:
+      - "127.0.0.1:${REVIEW_FRONTEND_PORT:-3010}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
