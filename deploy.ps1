@@ -46,7 +46,7 @@ $source = $PSScriptRoot
 $ExcludedFiles = @(
     'books.db', 'books.db-journal', 'books.db-wal', 'books.db-shm',
     '*.sqlite', '*.sqlite3',
-    '.env',
+    '.env', '.env.*',
     'deploy.ps1',
     '*.pyc', 'Thumbs.db', 'desktop.ini', '.DS_Store'
 )
@@ -54,7 +54,7 @@ $ExcludedFiles = @(
 # Build artefacts and local tooling: rebuilt on the server, and node_modules
 # would carry Windows binaries onto a Linux host.
 $ExcludedDirs = @(
-    'data',
+    'data', 'review-data',
     'node_modules', 'dist', '.vite',
     '__pycache__', '.venv', 'venv',
     '.git', '.vscode', '.idea'
@@ -89,7 +89,7 @@ if ($code -ge 8) {
 Write-Host ""
 Write-Host "Done (robocopy code $code)." -ForegroundColor Green
 if (-not $DryRun) {
-    Write-Host "The server's data directory and .env were left untouched."
+    Write-Host "The server's data directories and environment files were left untouched."
     Write-Host "Now restart the stack on the server: docker compose up -d --build"
 }
 exit 0
