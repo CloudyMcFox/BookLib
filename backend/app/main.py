@@ -9,10 +9,15 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 import csv
+import ipaddress
 import io
 import re
-from urllib.parse import urljoin, urlparse
+import socket
+from urllib.parse import quote, urljoin, urlsplit
 from fastapi.middleware.cors import CORSMiddleware
+import certifi
+import idna
+import urllib3
 
 # DB and auth config
 import os
@@ -998,57 +1003,123 @@ COVERS_BASE = "https://covers.openlibrary.org/b"
 MAX_COVER_BYTES = 5 * 1024 * 1024
 # OpenLibrary returns a 1x1 blank gif when it has no cover, so ignore tiny bodies.
 MIN_COVER_BYTES = 1000
-ALLOWED_COVER_HOSTS = {
-    "books.google.com",
-    "books.googleusercontent.com",
-    "covers.openlibrary.org",
-}
-
-
-def _is_allowed_cover_url(url: str) -> bool:
-    """Only fetch covers from the catalogue providers the application uses."""
+def _public_cover_target(url: str, resolver=socket.getaddrinfo):
+    """Validate a public HTTPS URL and return its checked address set."""
     try:
-        parsed = urlparse(url)
+        parsed = urlsplit(url)._replace(fragment="")
         port = parsed.port
     except ValueError:
-        return False
-    host = (parsed.hostname or "").lower()
-    return (
-        parsed.scheme == "https"
-        and parsed.username is None
-        and parsed.password is None
-        and port in (None, 443)
-        and any(host == allowed or host.endswith("." + allowed)
-                for allowed in ALLOWED_COVER_HOSTS)
-    )
+        return None
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.fragment
+    ):
+        return None
+
+    try:
+        ascii_hostname = idna.encode(
+            hostname.rstrip("."),
+            uts46=True,
+        ).decode("ascii")
+        addresses = []
+        for item in resolver(
+                ascii_hostname,
+                443,
+                type=socket.SOCK_STREAM,
+        ):
+            address = item[4][0]
+            if address not in addresses:
+                addresses.append(address)
+        parsed_addresses = [ipaddress.ip_address(address) for address in addresses]
+    except (OSError, UnicodeError, ValueError):
+        return None
+    # Reject the entire hostname when any answer can reach a non-public network.
+    # The request is then pinned to one checked address, preventing a second DNS
+    # lookup from changing the destination between validation and connection.
+    if not parsed_addresses or any(not address.is_global for address in parsed_addresses):
+        return None
+    return parsed, ascii_hostname, [str(address) for address in parsed_addresses]
 
 
 def _download_image(url: str) -> Optional[tuple]:
     """Download an image and return (bytes, mime), or None when unusable."""
-    if not _is_allowed_cover_url(url):
-        return None
-    try:
-        r = requests.get(url, timeout=10, allow_redirects=False)
-    except requests.RequestException:
-        return None
-    if 300 <= r.status_code < 400:
-        redirected = r.headers.get("Location")
-        redirected = urljoin(url, redirected) if redirected else None
-        if not redirected or not _is_allowed_cover_url(redirected):
+    current_url = url
+    for redirect_count in range(4):
+        target = _public_cover_target(current_url)
+        if not target:
             return None
+        parsed, hostname, addresses = target
+        path = quote(parsed.path or "/", safe="/%:@&=+$,~!()*'")
+        if parsed.query:
+            path += "?" + quote(parsed.query, safe="=&%/:;+?,@[]")
+        response = None
+        pool = None
         try:
-            r = requests.get(redirected, timeout=10, allow_redirects=False)
-        except requests.RequestException:
+            for address in addresses:
+                candidate_pool = urllib3.HTTPSConnectionPool(
+                    address,
+                    port=443,
+                    server_hostname=hostname,
+                    assert_hostname=hostname,
+                    cert_reqs="CERT_REQUIRED",
+                    ca_certs=certifi.where(),
+                    timeout=urllib3.Timeout(connect=5, read=10),
+                    retries=False,
+                    maxsize=1,
+                )
+                try:
+                    response = candidate_pool.urlopen(
+                        "GET",
+                        path,
+                        headers={
+                            "Host": hostname,
+                            "User-Agent": "BookLib/1.0",
+                            "Accept": "image/*",
+                            "Accept-Encoding": "identity",
+                        },
+                        redirect=False,
+                        preload_content=False,
+                    )
+                    pool = candidate_pool
+                    break
+                except (OSError, urllib3.exceptions.HTTPError):
+                    candidate_pool.close()
+            if response is None:
+                return None
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location or redirect_count == 3:
+                    return None
+                current_url = urljoin(current_url, location)
+                continue
+            if response.status != 200:
+                return None
+            encoding = (response.headers.get("Content-Encoding") or "identity").lower()
+            if encoding not in ("", "identity"):
+                return None
+            mime = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not mime.startswith("image/"):
+                return None
+            length = response.headers.get("Content-Length")
+            if length and int(length) > MAX_COVER_BYTES:
+                return None
+            content = response.read(MAX_COVER_BYTES + 1, decode_content=False)
+            if len(content) < MIN_COVER_BYTES or len(content) > MAX_COVER_BYTES:
+                return None
+            return content, mime
+        except (OSError, UnicodeError, ValueError, urllib3.exceptions.HTTPError):
             return None
-    if r.status_code != 200:
-        return None
-    content = r.content or b''
-    mime = (r.headers.get('Content-Type') or '').split(';')[0].strip().lower()
-    if not mime.startswith('image/'):
-        return None
-    if len(content) < MIN_COVER_BYTES or len(content) > MAX_COVER_BYTES:
-        return None
-    return content, mime
+        finally:
+            if response is not None:
+                response.release_conn()
+            if pool is not None:
+                pool.close()
+    return None
 
 
 # --- Google Books fallback ---
@@ -2246,7 +2317,7 @@ def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_use
         if supplied:
             raise HTTPException(
                 status_code=400,
-                detail="That address must be an HTTPS image under 5 MB from OpenLibrary or Google Books. Upload other images directly.",
+                detail="That address must be a direct public HTTPS image under 5 MB. Private-network addresses and unsafe redirects are blocked.",
             )
         raise HTTPException(status_code=404, detail="No cover found for this book on OpenLibrary or Google Books")
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))

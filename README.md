@@ -507,8 +507,9 @@ VITE_API_BASE=http://localhost:8882 npm run dev
   editing or book-moving access.
 - Stored covers require an authorization header; access tokens are never placed
   in image URLs.
-- Cover lookup URLs are restricted to HTTPS images from OpenLibrary and Google
-  Books. Upload other cover files directly.
+- Cover lookup URLs may use direct public HTTPS images. The backend pins a
+  validated public IP, blocks private/loopback/link-local destinations, checks
+  every redirect, requires an image response, and limits downloads to 5 MB.
 - Compose binds the frontend and backend to loopback. Put the frontend behind an
   HTTPS reverse proxy before exposing it to the Internet, and do not publish the
   plaintext backend port publicly.

@@ -1,6 +1,9 @@
 fastapi
 uvicorn[standard]
 requests
+certifi
+idna
+urllib3
 python-jose[cryptography]
 passlib
 python-multipart

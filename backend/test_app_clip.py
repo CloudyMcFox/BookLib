@@ -45,6 +45,51 @@ class AppClipCheckoutTests(unittest.TestCase):
         self.assertTrue(main.enabled_env("TEST_GUEST_FLAG"))
         del os.environ["TEST_GUEST_FLAG"]
 
+    def test_cover_urls_block_non_public_networks(self):
+        blocked = [
+            "http://example.com/cover.jpg",
+            "https://127.0.0.1/cover.jpg",
+            "https://10.0.0.1/cover.jpg",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/cover.jpg",
+            "https://user:password@example.com/cover.jpg",
+            "https://example.com:8443/cover.jpg",
+        ]
+        for url in blocked:
+            self.assertIsNone(main._public_cover_target(url), url)
+
+        self.assertIsNotNone(
+            main._public_cover_target("https://8.8.8.8/cover.jpg")
+        )
+
+    def test_cover_hostname_rejects_private_or_mixed_dns_answers(self):
+        def private_resolver(*args, **kwargs):
+            return [
+                (main.socket.AF_INET, main.socket.SOCK_STREAM, 6, "", ("10.0.0.1", 443))
+            ]
+
+        def mixed_resolver(*args, **kwargs):
+            return [
+                (main.socket.AF_INET, main.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
+                (main.socket.AF_INET, main.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+            ]
+
+        def public_resolver(*args, **kwargs):
+            return [
+                (main.socket.AF_INET6, main.socket.SOCK_STREAM, 6, "", ("2606:4700:4700::1111", 443, 0, 0)),
+                (main.socket.AF_INET, main.socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443)),
+            ]
+
+        url = "https://covers.example/cover with space.jpg#preview"
+        self.assertIsNone(main._public_cover_target(url, private_resolver))
+        self.assertIsNone(main._public_cover_target(url, mixed_resolver))
+        target = main._public_cover_target(url, public_resolver)
+        self.assertIsNotNone(target)
+        self.assertEqual(
+            target[2],
+            ["2606:4700:4700::1111", "1.1.1.1"],
+        )
+
     def test_lookup_returns_one_available_copy(self):
         main.conn.executemany(
             "INSERT INTO books (title, author, isbn, checked_out_at) VALUES (?, ?, ?, ?)",
