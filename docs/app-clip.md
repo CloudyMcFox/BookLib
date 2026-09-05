@@ -25,6 +25,16 @@ The server must:
 Users without App Clip support see a confirmation page before continuing to the
 server's normal web interface.
 
+For Apple App Clip Codes, which have a small URL payload, BookLib uses short
+aliases on `c.cloudstarsoftware.com`:
+
+```text
+https://c.cloudstarsoftware.com/p
+```
+
+The `p` alias opens the production BookLib server. The longer `/open?server=`
+form remains available for ordinary QR codes and arbitrary self-hosted servers.
+
 The invocation service is stateless. The server address stays in the QR URL; the
 service does not store server registrations, credentials, tokens, library
 contents, or borrower information.
@@ -34,6 +44,7 @@ contents, or borrower information.
 1. Create a Cloudflare Worker using
    `infrastructure/app-clip-worker.js` in module-worker mode.
 2. Add the custom domain `clip.booklib.cloudstarsoftware.com`.
+   Add `c.cloudstarsoftware.com` to the same Worker for short App Clip Codes.
 3. Confirm that both association URLs return JSON directly with no redirect:
 
    ```text

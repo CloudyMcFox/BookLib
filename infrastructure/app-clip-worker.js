@@ -14,6 +14,10 @@
 const APP_ID = "F346PUMJ54.com.cloudstarsoftware.booklib.CheckoutClip";
 const APP_STORE_ID = "6796158777";
 const APP_CLIP_BUNDLE_ID = "com.cloudstarsoftware.booklib.CheckoutClip";
+const SERVER_ALIASES = {
+  "/p": "https://booklib.cloudstarsoftware.com",
+  "/r": "https://booklib-review.cloudstarsoftware.com",
+};
 const AASA_PATHS = new Set([
   "/apple-app-site-association",
   "/.well-known/apple-app-site-association",
@@ -117,7 +121,7 @@ export default {
       });
     }
 
-    if (url.pathname !== "/open") {
+    if (url.pathname !== "/open" && !SERVER_ALIASES[url.pathname]) {
       return page(
         "BookLib App Clip",
         "<h1>BookLib</h1><p>Scan a BookLib checkout QR code to open a library.</p>",
@@ -125,7 +129,9 @@ export default {
       );
     }
 
-    const server = normalizedServer(url.searchParams.get("server"));
+    const server = normalizedServer(
+      SERVER_ALIASES[url.pathname] || url.searchParams.get("server"),
+    );
     if (!server) {
       return page(
         "Invalid BookLib link",

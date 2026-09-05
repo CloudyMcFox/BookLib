@@ -32,6 +32,21 @@ test("shows a confirmation page for a valid root server", async () => {
   assert.match(html, /app-clip-bundle-id=com\.cloudstarsoftware\.booklib\.CheckoutClip/);
 });
 
+test("resolves short production and review App Clip Code aliases", async () => {
+  const cases = [
+    ["/p", "booklib.cloudstarsoftware.com"],
+    ["/r", "booklib-review.cloudstarsoftware.com"],
+  ];
+  for (const [path, host] of cases) {
+    const response = await worker.fetch(new Request(
+      `https://c.cloudstarsoftware.com${path}`
+    ));
+    const html = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(html, new RegExp(host.replaceAll(".", "\\.")));
+  }
+});
+
 test("rejects unsafe or unsupported server URLs", async () => {
   const invalidServers = [
     "http://books.example.com",
