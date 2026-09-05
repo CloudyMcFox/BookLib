@@ -109,6 +109,7 @@ All settings live in `.env` (never committed — see `.env.example`).
 | `SECRET_KEY`     | Signs JWT access tokens. **Generate your own.**                 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default `480`, i.e. 8 hours)       |
 | `GUEST_ACCESS_ENABLED` | Explicitly enable public guest browsing and checkout (default `false`) |
+| `GUEST_SHELF_ACCESS_ENABLED` | Let guests browse shelf names and book positions (default `false`) |
 | `GUEST_TOKEN_EXPIRE_MINUTES` | Guest session lifetime (default `120`)             |
 | `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
 | `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
@@ -226,6 +227,7 @@ or check books in. Guests may use the checkout route.
 | `POST`   | `/token/guest`    | Get a browse/checkout guest JWT, no credentials |
 | `GET`    | `/auth/config`    | Whether guest access is enabled          |
 | `GET`    | `/me`             | Caller's username, role and `read_only` flag |
+| `GET`    | `/guest-checkout/isbn/{isbn}` | Exact ISBN summary and availability for App Clip checkout |
 | `GET`    | `/books`          | List books, optional search, sorting, catalogue filters, and `?checked_out=true|false` |
 | `POST`   | `/books`          | Add a book                               |
 | `GET`    | `/books/{id}`     | Fetch one book                           |
@@ -500,13 +502,25 @@ VITE_API_BASE=http://localhost:8882 npm run dev
   the application to browse public catalogue fields and check out available
   books under a supplied name. Private notes, borrower identities, checkout
   timestamps, and shelf locations are not returned to guests.
+- Set `GUEST_SHELF_ACCESS_ENABLED=true` separately when guests should be able to
+  browse the visual bookshelf and physical positions. This never grants shelf
+  editing or book-moving access.
 - Stored covers require an authorization header; access tokens are never placed
   in image URLs.
-- Cover lookup URLs are restricted to HTTPS images from OpenLibrary and Google
-  Books. Upload other cover files directly.
+- Cover lookup URLs may use direct public HTTPS images. The backend pins a
+  validated public IP, blocks private/loopback/link-local destinations, checks
+  every redirect, requires an image response, and limits downloads to 5 MB.
 - Compose binds the frontend and backend to loopback. Put the frontend behind an
   HTTPS reverse proxy before exposing it to the Internet, and do not publish the
   plaintext backend port publicly.
+
+## App Clip invocation service
+
+`infrastructure/app-clip-worker.js` is the stateless Cloudflare Worker used by
+the BookLib App Clip invocation domain. It serves Apple's association file and
+a browser fallback that confirms the destination before opening a self-hosted
+server. Deployment and QR URL details are available on the
+[App Clip documentation page](https://cloudymcfox.github.io/BookLib/app-clip/).
 
 ## License
 

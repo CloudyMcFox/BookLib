@@ -9,10 +9,15 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 import csv
+import ipaddress
 import io
 import re
-from urllib.parse import urljoin, urlparse
+import socket
+from urllib.parse import quote, urljoin, urlsplit
 from fastapi.middleware.cors import CORSMiddleware
+import certifi
+import idna
+import urllib3
 
 # DB and auth config
 import os
@@ -32,9 +37,16 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 
 
 # Guest access: anyone can browse and use circulation without an account.
 # Guests are not rows in users, they are only a claim in the token, so there is
-# no password to leak and nothing to keep in sync. Set
-# GUEST_ACCESS_ENABLED=true to opt in explicitly.
-GUEST_ACCESS_ENABLED = os.environ.get("GUEST_ACCESS_ENABLED", "false").strip().lower() not in ("0", "false", "no")
+# no password to leak and nothing to keep in sync.
+def enabled_env(name: str, default: bool = False) -> bool:
+    fallback = "true" if default else "false"
+    return os.environ.get(name, fallback).strip().lower() in ("1", "true", "yes")
+
+
+# Both guest capabilities fail closed: only an explicit true value enables
+# unauthenticated access.
+GUEST_ACCESS_ENABLED = enabled_env("GUEST_ACCESS_ENABLED")
+GUEST_SHELF_ACCESS_ENABLED = enabled_env("GUEST_SHELF_ACCESS_ENABLED")
 GUEST_USERNAME = "guest"
 ROLE_GUEST = "guest"
 ROLE_ADMIN = "admin"
@@ -343,14 +355,18 @@ def book_for_user(book: Book, current_user: dict) -> Book:
     """Guests get catalogue data and availability, never private owner data."""
     if not is_guest(current_user):
         return book
-    return book.copy(update={
+    hidden = {
         "notes": None,
-        "shelf_id": None,
-        "shelf_column": None,
-        "shelf_row": None,
         "borrower_name": None,
         "checked_out_at": None,
-    })
+    }
+    if not GUEST_SHELF_ACCESS_ENABLED:
+        hidden.update({
+            "shelf_id": None,
+            "shelf_column": None,
+            "shelf_row": None,
+        })
+    return book.copy(update=hidden)
 
 class Token(BaseModel):
     access_token: str
@@ -389,6 +405,61 @@ class UserCreate(BaseModel):
 
 class CheckoutRequest(BaseModel):
     borrower_name: str
+
+
+class GuestCheckoutLookup(BaseModel):
+    isbn: str
+    title: str
+    author: Optional[str] = None
+    available_count: int
+    total_count: int
+    book_id: Optional[int] = None
+
+
+def isbn_equivalents(value: str) -> set[str]:
+    """Return normalized ISBN-10/13 forms when a conversion is possible."""
+    normalized = re.sub(r"[^0-9Xx]", "", value).upper()
+    if len(normalized) == 10:
+        if not normalized[:9].isdigit() or not (
+            normalized[9].isdigit() or normalized[9] == "X"
+        ):
+            return set()
+        digits = [int(digit) for digit in normalized[:9]]
+        digits.append(10 if normalized[9] == "X" else int(normalized[9]))
+        if sum((10 - index) * digit
+               for index, digit in enumerate(digits)) % 11 != 0:
+            return set()
+    elif len(normalized) == 13:
+        if not normalized.isdigit():
+            return set()
+        expected = (10 - sum(
+            int(digit) * (1 if index % 2 == 0 else 3)
+            for index, digit in enumerate(normalized[:12])
+        ) % 10) % 10
+        if int(normalized[12]) != expected:
+            return set()
+    else:
+        return set()
+
+    equivalents = {normalized}
+
+    if len(normalized) == 10:
+        body = "978" + normalized[:9]
+        total = sum(
+            int(digit) * (1 if index % 2 == 0 else 3)
+            for index, digit in enumerate(body)
+        )
+        equivalents.add(body + str((10 - total % 10) % 10))
+
+    if len(normalized) == 13 and normalized.startswith("978"):
+        body = normalized[3:12]
+        total = sum((10 - index) * int(digit)
+                    for index, digit in enumerate(body))
+        check = (11 - total % 11) % 11
+        equivalents.add(body + ("X" if check == 10 else str(check)))
+
+    return equivalents
+
 
 # initialize DB
 conn = get_conn()
@@ -893,6 +964,12 @@ def require_editor(current_user: dict = Depends(get_current_user)):
     return current_user
 
 
+def require_shelf_reader(current_user: dict = Depends(get_current_user)):
+    if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
+        raise HTTPException(status_code=403, detail="Guest shelf access is disabled")
+    return current_user
+
+
 def is_guest(user: Optional[dict]) -> bool:
     return bool(user) and user.get('role') == ROLE_GUEST
 
@@ -926,57 +1003,123 @@ COVERS_BASE = "https://covers.openlibrary.org/b"
 MAX_COVER_BYTES = 5 * 1024 * 1024
 # OpenLibrary returns a 1x1 blank gif when it has no cover, so ignore tiny bodies.
 MIN_COVER_BYTES = 1000
-ALLOWED_COVER_HOSTS = {
-    "books.google.com",
-    "books.googleusercontent.com",
-    "covers.openlibrary.org",
-}
-
-
-def _is_allowed_cover_url(url: str) -> bool:
-    """Only fetch covers from the catalogue providers the application uses."""
+def _public_cover_target(url: str, resolver=socket.getaddrinfo):
+    """Validate a public HTTPS URL and return its checked address set."""
     try:
-        parsed = urlparse(url)
+        parsed = urlsplit(url)._replace(fragment="")
         port = parsed.port
     except ValueError:
-        return False
-    host = (parsed.hostname or "").lower()
-    return (
-        parsed.scheme == "https"
-        and parsed.username is None
-        and parsed.password is None
-        and port in (None, 443)
-        and any(host == allowed or host.endswith("." + allowed)
-                for allowed in ALLOWED_COVER_HOSTS)
-    )
+        return None
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.fragment
+    ):
+        return None
+
+    try:
+        ascii_hostname = idna.encode(
+            hostname.rstrip("."),
+            uts46=True,
+        ).decode("ascii")
+        addresses = []
+        for item in resolver(
+                ascii_hostname,
+                443,
+                type=socket.SOCK_STREAM,
+        ):
+            address = item[4][0]
+            if address not in addresses:
+                addresses.append(address)
+        parsed_addresses = [ipaddress.ip_address(address) for address in addresses]
+    except (OSError, UnicodeError, ValueError):
+        return None
+    # Reject the entire hostname when any answer can reach a non-public network.
+    # The request is then pinned to one checked address, preventing a second DNS
+    # lookup from changing the destination between validation and connection.
+    if not parsed_addresses or any(not address.is_global for address in parsed_addresses):
+        return None
+    return parsed, ascii_hostname, [str(address) for address in parsed_addresses]
 
 
 def _download_image(url: str) -> Optional[tuple]:
     """Download an image and return (bytes, mime), or None when unusable."""
-    if not _is_allowed_cover_url(url):
-        return None
-    try:
-        r = requests.get(url, timeout=10, allow_redirects=False)
-    except requests.RequestException:
-        return None
-    if 300 <= r.status_code < 400:
-        redirected = r.headers.get("Location")
-        redirected = urljoin(url, redirected) if redirected else None
-        if not redirected or not _is_allowed_cover_url(redirected):
+    current_url = url
+    for redirect_count in range(4):
+        target = _public_cover_target(current_url)
+        if not target:
             return None
+        parsed, hostname, addresses = target
+        path = quote(parsed.path or "/", safe="/%:@&=+$,~!()*'")
+        if parsed.query:
+            path += "?" + quote(parsed.query, safe="=&%/:;+?,@[]")
+        response = None
+        pool = None
         try:
-            r = requests.get(redirected, timeout=10, allow_redirects=False)
-        except requests.RequestException:
+            for address in addresses:
+                candidate_pool = urllib3.HTTPSConnectionPool(
+                    address,
+                    port=443,
+                    server_hostname=hostname,
+                    assert_hostname=hostname,
+                    cert_reqs="CERT_REQUIRED",
+                    ca_certs=certifi.where(),
+                    timeout=urllib3.Timeout(connect=5, read=10),
+                    retries=False,
+                    maxsize=1,
+                )
+                try:
+                    response = candidate_pool.urlopen(
+                        "GET",
+                        path,
+                        headers={
+                            "Host": hostname,
+                            "User-Agent": "BookLib/1.0",
+                            "Accept": "image/*",
+                            "Accept-Encoding": "identity",
+                        },
+                        redirect=False,
+                        preload_content=False,
+                    )
+                    pool = candidate_pool
+                    break
+                except (OSError, urllib3.exceptions.HTTPError):
+                    candidate_pool.close()
+            if response is None:
+                return None
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+                if not location or redirect_count == 3:
+                    return None
+                current_url = urljoin(current_url, location)
+                continue
+            if response.status != 200:
+                return None
+            encoding = (response.headers.get("Content-Encoding") or "identity").lower()
+            if encoding not in ("", "identity"):
+                return None
+            mime = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if not mime.startswith("image/"):
+                return None
+            length = response.headers.get("Content-Length")
+            if length and int(length) > MAX_COVER_BYTES:
+                return None
+            content = response.read(MAX_COVER_BYTES + 1, decode_content=False)
+            if len(content) < MIN_COVER_BYTES or len(content) > MAX_COVER_BYTES:
+                return None
+            return content, mime
+        except (OSError, UnicodeError, ValueError, urllib3.exceptions.HTTPError):
             return None
-    if r.status_code != 200:
-        return None
-    content = r.content or b''
-    mime = (r.headers.get('Content-Type') or '').split(';')[0].strip().lower()
-    if not mime.startswith('image/'):
-        return None
-    if len(content) < MIN_COVER_BYTES or len(content) > MAX_COVER_BYTES:
-        return None
-    return content, mime
+        finally:
+            if response is not None:
+                response.release_conn()
+            if pool is not None:
+                pool.close()
+    return None
 
 
 # --- Google Books fallback ---
@@ -1709,7 +1852,10 @@ def guest_access_token():
 @app.get("/auth/config")
 def auth_config():
     """What the login screen needs to know before anyone has signed in."""
-    return {"guest_access_enabled": GUEST_ACCESS_ENABLED}
+    return {
+        "guest_access_enabled": GUEST_ACCESS_ENABLED,
+        "guest_shelf_access_enabled": GUEST_SHELF_ACCESS_ENABLED,
+    }
 
 
 @app.get("/me")
@@ -1720,6 +1866,40 @@ def read_me(current_user: dict = Depends(get_current_user)):
         "role": current_user.get('role', ROLE_ADMIN),
         "read_only": is_guest(current_user),
     }
+
+
+@app.get("/guest-checkout/isbn/{isbn}", response_model=GuestCheckoutLookup)
+def guest_checkout_lookup(isbn: str,
+                          current_user: dict = Depends(get_current_user)):
+    """Find an exact ISBN and one available physical copy for quick checkout."""
+    equivalents = isbn_equivalents(isbn)
+    if not equivalents:
+        raise HTTPException(status_code=400, detail="ISBN must contain 10 or 13 digits")
+    normalized = re.sub(r"[^0-9Xx]", "", isbn).upper()
+
+    rows = conn.execute(
+        """SELECT id, title, author, isbn, checked_out_at
+           FROM books
+           WHERE isbn IS NOT NULL AND TRIM(isbn) <> ''
+           ORDER BY id"""
+    ).fetchall()
+    matches = [
+        row for row in rows
+        if re.sub(r"[^0-9Xx]", "", row["isbn"] or "").upper() in equivalents
+    ]
+    if not matches:
+        raise HTTPException(status_code=404, detail="This book is not in this library")
+
+    available = [row for row in matches if row["checked_out_at"] is None]
+    representative = available[0] if available else matches[0]
+    return GuestCheckoutLookup(
+        isbn=normalized,
+        title=representative["title"],
+        author=representative["author"],
+        available_count=len(available),
+        total_count=len(matches),
+        book_id=available[0]["id"] if available else None,
+    )
 
 
 @app.get("/books", response_model=List[Book])
@@ -1754,13 +1934,13 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         params.extend([pattern] * len(searchable))
 
     if shelf_id is not None:
-        if is_guest(current_user):
+        if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
             raise HTTPException(status_code=403, detail="Shelf locations are private")
         where.append("shelf_id = ?")
         params.append(shelf_id)
 
     if placed is not None:
-        if is_guest(current_user):
+        if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
             raise HTTPException(status_code=403, detail="Shelf locations are private")
         where.append("shelf_id IS NOT NULL" if placed else "shelf_id IS NULL")
 
@@ -1845,7 +2025,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     return [book_for_user(book, current_user) for book in books]
 
 @app.get("/shelves", response_model=List[Shelf])
-def list_shelves(current_user: dict = Depends(require_editor)):
+def list_shelves(current_user: dict = Depends(require_shelf_reader)):
     counts = {r['shelf_id']: r['n'] for r in conn.execute(
         "SELECT shelf_id, COUNT(*) AS n FROM books WHERE shelf_id IS NOT NULL GROUP BY shelf_id")}
     rows = conn.execute("SELECT * FROM shelves ORDER BY sort_order, id").fetchall()
@@ -1908,7 +2088,8 @@ def delete_shelf(shelf_id: int, current_user: dict = Depends(require_editor)):
 
 
 @app.get("/shelves/{shelf_id}/layout", response_model=ShelfLayout)
-def shelf_layout(shelf_id: int, current_user: dict = Depends(require_editor)):
+def shelf_layout(shelf_id: int,
+                 current_user: dict = Depends(require_shelf_reader)):
     """A shelf plus what is currently in each slot, for drawing the picker."""
     shelf = get_shelf(shelf_id)
     if not shelf:
@@ -2136,7 +2317,7 @@ def lookup_book_cover(book_id: int, cover_url: Optional[str] = None, current_use
         if supplied:
             raise HTTPException(
                 status_code=400,
-                detail="That address must be an HTTPS image under 5 MB from OpenLibrary or Google Books. Upload other images directly.",
+                detail="That address must be a direct public HTTPS image under 5 MB. Private-network addresses and unsafe redirects are blocked.",
             )
         raise HTTPException(status_code=404, detail="No cover found for this book on OpenLibrary or Google Books")
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))

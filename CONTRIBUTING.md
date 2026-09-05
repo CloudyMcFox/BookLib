@@ -33,10 +33,14 @@ python -m py_compile \
   backend/create_user.py \
   backend/change_password.py \
   backend/list_users.py
+python -m unittest backend.test_app_clip
 
 cd frontend
 npm ci
 npm run build
+
+cd ..
+node --test infrastructure/app-clip-worker.test.mjs
 ```
 
 When Docker is available, also validate the complete image build:
