@@ -28,7 +28,11 @@ const ASSOCIATION = {
     details: [
       {
         appIDs: ["F346PUMJ54.com.cloudstarsoftware.booklib"],
-        components: [{ "/": "/open" }],
+        components: [
+          { "/": "/open" },
+          { "/": "/p" },
+          { "/": "/r" },
+        ],
       },
     ],
   },

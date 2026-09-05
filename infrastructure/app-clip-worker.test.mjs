@@ -17,6 +17,12 @@ test("serves the App Clip and universal-link associations", async () => {
   assert.deepEqual(association.applinks.details[0].appIDs, [
     "F346PUMJ54.com.cloudstarsoftware.booklib",
   ]);
+  assert.deepEqual(
+    association.applinks.details[0].components.map(
+      (component) => component["/"],
+    ),
+    ["/open", "/p", "/r"],
+  );
 });
 
 test("shows a confirmation page for a valid root server", async () => {
