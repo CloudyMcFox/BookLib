@@ -32,9 +32,16 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", 
 
 # Guest access: anyone can browse and use circulation without an account.
 # Guests are not rows in users, they are only a claim in the token, so there is
-# no password to leak and nothing to keep in sync. Set
-# GUEST_ACCESS_ENABLED=true to opt in explicitly.
-GUEST_ACCESS_ENABLED = os.environ.get("GUEST_ACCESS_ENABLED", "false").strip().lower() not in ("0", "false", "no")
+# no password to leak and nothing to keep in sync.
+def enabled_env(name: str, default: bool = False) -> bool:
+    fallback = "true" if default else "false"
+    return os.environ.get(name, fallback).strip().lower() in ("1", "true", "yes")
+
+
+# Both guest capabilities fail closed: only an explicit true value enables
+# unauthenticated access.
+GUEST_ACCESS_ENABLED = enabled_env("GUEST_ACCESS_ENABLED")
+GUEST_SHELF_ACCESS_ENABLED = enabled_env("GUEST_SHELF_ACCESS_ENABLED")
 GUEST_USERNAME = "guest"
 ROLE_GUEST = "guest"
 ROLE_ADMIN = "admin"
@@ -343,14 +350,18 @@ def book_for_user(book: Book, current_user: dict) -> Book:
     """Guests get catalogue data and availability, never private owner data."""
     if not is_guest(current_user):
         return book
-    return book.copy(update={
+    hidden = {
         "notes": None,
-        "shelf_id": None,
-        "shelf_column": None,
-        "shelf_row": None,
         "borrower_name": None,
         "checked_out_at": None,
-    })
+    }
+    if not GUEST_SHELF_ACCESS_ENABLED:
+        hidden.update({
+            "shelf_id": None,
+            "shelf_column": None,
+            "shelf_row": None,
+        })
+    return book.copy(update=hidden)
 
 class Token(BaseModel):
     access_token: str
@@ -945,6 +956,12 @@ def require_editor(current_user: dict = Depends(get_current_user)):
     """Dependency for catalogue writes; circulation has separate endpoints."""
     if is_guest(current_user):
         raise HTTPException(status_code=403, detail="Guest accounts cannot edit the catalogue")
+    return current_user
+
+
+def require_shelf_reader(current_user: dict = Depends(get_current_user)):
+    if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
+        raise HTTPException(status_code=403, detail="Guest shelf access is disabled")
     return current_user
 
 
@@ -1764,7 +1781,10 @@ def guest_access_token():
 @app.get("/auth/config")
 def auth_config():
     """What the login screen needs to know before anyone has signed in."""
-    return {"guest_access_enabled": GUEST_ACCESS_ENABLED}
+    return {
+        "guest_access_enabled": GUEST_ACCESS_ENABLED,
+        "guest_shelf_access_enabled": GUEST_SHELF_ACCESS_ENABLED,
+    }
 
 
 @app.get("/me")
@@ -1843,13 +1863,13 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         params.extend([pattern] * len(searchable))
 
     if shelf_id is not None:
-        if is_guest(current_user):
+        if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
             raise HTTPException(status_code=403, detail="Shelf locations are private")
         where.append("shelf_id = ?")
         params.append(shelf_id)
 
     if placed is not None:
-        if is_guest(current_user):
+        if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
             raise HTTPException(status_code=403, detail="Shelf locations are private")
         where.append("shelf_id IS NOT NULL" if placed else "shelf_id IS NULL")
 
@@ -1934,7 +1954,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     return [book_for_user(book, current_user) for book in books]
 
 @app.get("/shelves", response_model=List[Shelf])
-def list_shelves(current_user: dict = Depends(require_editor)):
+def list_shelves(current_user: dict = Depends(require_shelf_reader)):
     counts = {r['shelf_id']: r['n'] for r in conn.execute(
         "SELECT shelf_id, COUNT(*) AS n FROM books WHERE shelf_id IS NOT NULL GROUP BY shelf_id")}
     rows = conn.execute("SELECT * FROM shelves ORDER BY sort_order, id").fetchall()
@@ -1997,7 +2017,8 @@ def delete_shelf(shelf_id: int, current_user: dict = Depends(require_editor)):
 
 
 @app.get("/shelves/{shelf_id}/layout", response_model=ShelfLayout)
-def shelf_layout(shelf_id: int, current_user: dict = Depends(require_editor)):
+def shelf_layout(shelf_id: int,
+                 current_user: dict = Depends(require_shelf_reader)):
     """A shelf plus what is currently in each slot, for drawing the picker."""
     shelf = get_shelf(shelf_id)
     if not shelf:

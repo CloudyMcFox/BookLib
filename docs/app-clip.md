@@ -20,6 +20,7 @@ The server must:
 - Serve BookLib from the origin root, not from a URL subpath
 - Run a BookLib release that supports App Clip guest checkout
 - Have `GUEST_ACCESS_ENABLED=true`
+- Set `GUEST_SHELF_ACCESS_ENABLED=true` to show the visual bookshelf
 
 Users without App Clip support see a confirmation page before continuing to the
 server's normal web interface.

@@ -109,6 +109,7 @@ All settings live in `.env` (never committed — see `.env.example`).
 | `SECRET_KEY`     | Signs JWT access tokens. **Generate your own.**                 |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default `480`, i.e. 8 hours)       |
 | `GUEST_ACCESS_ENABLED` | Explicitly enable public guest browsing and checkout (default `false`) |
+| `GUEST_SHELF_ACCESS_ENABLED` | Let guests browse shelf names and book positions (default `false`) |
 | `GUEST_TOKEN_EXPIRE_MINUTES` | Guest session lifetime (default `120`)             |
 | `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
 | `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
@@ -501,6 +502,9 @@ VITE_API_BASE=http://localhost:8882 npm run dev
   the application to browse public catalogue fields and check out available
   books under a supplied name. Private notes, borrower identities, checkout
   timestamps, and shelf locations are not returned to guests.
+- Set `GUEST_SHELF_ACCESS_ENABLED=true` separately when guests should be able to
+  browse the visual bookshelf and physical positions. This never grants shelf
+  editing or book-moving access.
 - Stored covers require an authorization header; access tokens are never placed
   in image URLs.
 - Cover lookup URLs are restricted to HTTPS images from OpenLibrary and Google
