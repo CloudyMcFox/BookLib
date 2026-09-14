@@ -2246,6 +2246,51 @@ export default function App(){
     confirmText: n=> `Look up descriptions for ${n} book${n===1?'':'s'}?\n\nDescriptions already stored, including any you wrote yourself, will be replaced where one is found.`,
   })
 
+  const refreshMissingField = async ({targets, endpoint, label, query='', after})=>{
+    if(!targets.length) return
+    for(let i=0;i<targets.length;i++){
+      setRefreshing(`${label} ${i+1}/${targets.length}...`)
+      try{
+        const res = await fetch(
+          `${API_BASE}/books/${targets[i].id}/${endpoint}/lookup${query}`,
+          {method:'POST', headers: authHeaders()},
+        )
+        if(res.ok){
+          const updated = await res.json()
+          setBooks(prev=> prev.map(x=> x.id===updated.id ? {...x, ...updated} : x))
+        }
+      }catch(e){ console.error(`${endpoint} refresh failed`, e) }
+    }
+    setRefreshing(null)
+    if(after) after()
+  }
+
+  const missingTagBooks = books.filter(
+    b=> (b.isbn || b.olid || b.title) && (!Array.isArray(b.tags) || b.tags.length===0))
+  const missingSeriesBooks = books.filter(
+    b=> (b.isbn || b.olid || b.title) && !(b.series || '').trim())
+  const missingDescriptionBooks = books.filter(
+    b=> (b.isbn || b.olid || b.title) && !(b.description || '').trim())
+
+  const refreshMissingTags = ()=> refreshMissingField({
+    targets: missingTagBooks,
+    endpoint: 'tags',
+    label: 'Tags',
+    query: '?replace=false',
+    after: fetchTags,
+  })
+  const refreshMissingSeries = ()=> refreshMissingField({
+    targets: missingSeriesBooks,
+    endpoint: 'series',
+    label: 'Series',
+    after: fetchSeries,
+  })
+  const refreshMissingDescriptions = ()=> refreshMissingField({
+    targets: missingDescriptionBooks,
+    endpoint: 'description',
+    label: 'Descriptions',
+  })
+
   const loadMe = async ()=>{
     setMeError(null)
     try{
@@ -2503,7 +2548,24 @@ export default function App(){
               )}
               {!readOnly && books.length>0 && (
                 <div className="bulk-actions">
-                  <span className="muted">Fill in the whole list from the catalogues:</span>
+                  <span className="muted">Fill in missing catalogue details:</span>
+                  <button type="button" onClick={refreshMissingTags}
+                          disabled={!!refreshing || missingTagBooks.length===0}>
+                    Refresh missing tags ({missingTagBooks.length})
+                  </button>
+                  <button type="button" onClick={refreshMissingSeries}
+                          disabled={!!refreshing || missingSeriesBooks.length===0}>
+                    Refresh missing series ({missingSeriesBooks.length})
+                  </button>
+                  <button type="button" onClick={refreshMissingDescriptions}
+                          disabled={!!refreshing || missingDescriptionBooks.length===0}>
+                    Refresh missing descriptions ({missingDescriptionBooks.length})
+                  </button>
+                </div>
+              )}
+              {!readOnly && books.length>0 && (
+                <div className="bulk-actions">
+                  <span className="muted">Replace existing catalogue details:</span>
                   <button type="button" onClick={refreshAllSeries} disabled={!!refreshing}
                           title="Look up the series and volume number for every book listed below">
                     Refresh all series
