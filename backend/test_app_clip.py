@@ -36,6 +36,108 @@ class AppClipCheckoutTests(unittest.TestCase):
         self.assertEqual(main.isbn_equivalents("0306406153"), set())
         self.assertEqual(main.isbn_equivalents("9780306406158"), set())
 
+    def test_missing_isbn_placeholder_is_not_used_for_duplicate_matching(self):
+        self.assertIsNone(main.duplicate_isbn("0000000000"))
+        self.assertIsNone(main.duplicate_isbn("000-000-000-0"))
+        self.assertEqual(main.duplicate_isbn("0-306-40615-2"), "0306406152")
+
+        user = {"username": "test", "role": main.ROLE_ADMIN}
+        main.add_book(
+            main.Book(
+                title="First unnumbered book",
+                author="First Author",
+                isbn="0000000000",
+                format="Other",
+            ),
+            main.BackgroundTasks(),
+            current_user=user,
+        )
+        main.add_book(
+            main.Book(
+                title="Second unnumbered book",
+                author="Second Author",
+                isbn="000-000-000-0",
+                format="Other",
+            ),
+            main.BackgroundTasks(),
+            current_user=user,
+        )
+
+        books = main.list_books(current_user=user)
+        self.assertEqual([book.copy_count for book in books], [1, 1])
+        self.assertEqual(main.matching_edition_ids(books[0].id), [books[0].id])
+
+    def test_catalogue_title_case_keeps_small_words_lowercase(self):
+        self.assertEqual(
+            main.catalogue_title_case("Sunset of the sabertooth"),
+            "Sunset of the Sabertooth",
+        )
+        self.assertEqual(
+            main.catalogue_title_case("the lion, the witch and the wardrobe"),
+            "The Lion, the Witch and the Wardrobe",
+        )
+        self.assertEqual(
+            main.catalogue_title_case("journey to iPhone island: rise of NASA"),
+            "Journey to iPhone Island: Rise of NASA",
+        )
+
+    def test_catalogue_name_case_preserves_name_particles_and_custom_case(self):
+        self.assertEqual(
+            main.catalogue_name_case("mary pope osborne"),
+            "Mary Pope Osborne",
+        )
+        self.assertEqual(
+            main.catalogue_name_case("alexandre dumas de la cruz"),
+            "Alexandre Dumas de la Cruz",
+        )
+        self.assertEqual(main.catalogue_name_case("sean o'brien"), "Sean O'Brien")
+        self.assertEqual(main.catalogue_name_case("Maggie O'Farrell"), "Maggie O'Farrell")
+
+    def test_manual_metadata_casing_is_preserved(self):
+        added = main.add_book(
+            main.Book(
+                title="manually cased title",
+                author="e. e. cummings",
+                isbn="123456789X",
+                format="Other",
+                series="my manually cased saga",
+            ),
+            main.BackgroundTasks(),
+            current_user={"username": "test", "role": main.ROLE_ADMIN},
+        )
+
+        self.assertEqual(added.title, "manually cased title")
+        self.assertEqual(added.author, "e. e. cummings")
+        self.assertEqual(added.series, "my manually cased saga")
+
+    def test_duplicate_filter_groups_repeated_isbns_and_ignores_placeholder(self):
+        main.conn.executemany(
+            "INSERT INTO books (title, author, isbn) VALUES (?, ?, ?)",
+            [
+                ("Zulu copy", "Author", "978-1-23456-789-7"),
+                ("Unrelated", "Author", "9781111111113"),
+                ("Alpha copy", "Author", "9781234567897"),
+                ("Missing one", "Author", "0000000000"),
+                ("Missing two", "Author", "000-000-000-0"),
+                ("Second group A", "Author", "9782222222226"),
+                ("Second group B", "Author", "9782222222226"),
+            ],
+        )
+        main.conn.commit()
+
+        books = main.list_books(
+            duplicates_only=True,
+            sort="title",
+            dir="asc",
+            current_user={"username": "test", "role": main.ROLE_ADMIN},
+        )
+
+        self.assertEqual(
+            [main.duplicate_isbn(book.isbn) for book in books],
+            ["9781234567897", "9781234567897", "9782222222226", "9782222222226"],
+        )
+        self.assertEqual([book.copy_count for book in books], [2, 2, 2, 2])
+
     def test_guest_flags_fail_closed(self):
         os.environ["TEST_GUEST_FLAG"] = "flase"
         self.assertFalse(main.enabled_env("TEST_GUEST_FLAG"))
