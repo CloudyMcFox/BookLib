@@ -111,6 +111,100 @@ def duplicate_isbn(value: Optional[str]) -> Optional[str]:
     return normalized if normalized and normalized != '0000000000' else None
 
 
+_LOWERCASE_TITLE_WORDS = {
+    'a', 'an', 'and', 'as', 'at', 'but', 'by', 'for', 'from', 'in', 'nor',
+    'of', 'on', 'or', 'per', 'the', 'to', 'via', 'vs',
+}
+_TITLE_WORD = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)*")
+
+
+def catalogue_title_case(value: Optional[str]) -> Optional[str]:
+    """Normalize sentence-cased catalogue text without damaging proper casing."""
+    text = clean(value)
+    if not text:
+        return None
+    matches = list(_TITLE_WORD.finditer(text))
+    if not matches:
+        return text
+    all_uppercase = text.upper() == text and text.lower() != text
+    pieces = []
+    cursor = 0
+    for index, match in enumerate(matches):
+        pieces.append(text[cursor:match.start()])
+        word = match.group()
+        lower = word.lower()
+        separator = text[matches[index - 1].end():match.start()] if index else ''
+        emphasized = index == 0 or index == len(matches) - 1 or any(
+            marker in separator for marker in (':', '—', '–')
+        )
+        has_custom_case = (
+            not all_uppercase
+            and word != word.lower()
+            and word != word.upper()
+            and not (word[:1].isupper() and word[1:].islower())
+        )
+        is_acronym = not all_uppercase and len(word) > 1 and word == word.upper()
+        if has_custom_case or is_acronym:
+            replacement = word
+        elif lower in _LOWERCASE_TITLE_WORDS and not emphasized:
+            replacement = lower
+        else:
+            replacement = lower[:1].upper() + lower[1:]
+        pieces.append(replacement)
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return ''.join(pieces)
+
+
+_LOWERCASE_NAME_PARTICLES = {
+    'da', 'de', 'del', 'della', 'der', 'di', 'dos', 'du', 'la', 'le', 'van',
+    'von',
+}
+
+
+def catalogue_name_case(value: Optional[str]) -> Optional[str]:
+    """Normalize a catalogue-provided person name while preserving intentional casing."""
+    text = clean(value)
+    if not text:
+        return None
+    matches = list(_TITLE_WORD.finditer(text))
+    pieces = []
+    cursor = 0
+    for index, match in enumerate(matches):
+        pieces.append(text[cursor:match.start()])
+        word = match.group()
+        lower = word.lower()
+        has_custom_case = (
+            word != word.lower()
+            and word != word.upper()
+            and not (word[:1].isupper() and word[1:].islower())
+        )
+        is_initial = len(word) == 1
+        if has_custom_case or is_initial:
+            replacement = word
+        elif lower in _LOWERCASE_NAME_PARTICLES and index > 0:
+            replacement = lower
+        else:
+            replacement = re.sub(
+                r"(^|['’])([a-z])",
+                lambda part: part.group(1) + part.group(2).upper(),
+                lower,
+            )
+        pieces.append(replacement)
+        cursor = match.end()
+    pieces.append(text[cursor:])
+    return ''.join(pieces)
+
+
+def catalogue_names(values) -> List[str]:
+    names = []
+    for value in values or []:
+        formatted = catalogue_name_case(value)
+        if formatted:
+            names.append(formatted)
+    return names
+
+
 def clean_olid(value: Optional[str]) -> Optional[str]:
     """Normalise an OpenLibrary edition id, accepting '/books/OL123M' or a bare
     'ol123m'. Returns None when no valid id is present."""
@@ -1695,7 +1789,7 @@ def _fetch_series(olid: Optional[str], isbn: Optional[str], title: Optional[str]
             # its number from the title.
             if index is None:
                 index = _series_from_title(edition.get('title'), title)[1]
-            return (name, index)
+            return (catalogue_title_case(name), index)
 
     # OpenLibrary titles and subtitles, then Google's, then ours.
     candidates: List[Optional[str]] = []
@@ -1709,7 +1803,7 @@ def _fetch_series(olid: Optional[str], isbn: Optional[str], title: Optional[str]
     candidates.append(title)
 
     name, index = _series_from_title(*candidates)
-    return (name, index)
+    return (catalogue_title_case(name), index)
 
 
 def _fetch_description(olid: Optional[str], isbn: Optional[str], title: Optional[str] = None,
@@ -2748,8 +2842,8 @@ def _google_search(title: Optional[str], author: Optional[str], q: Optional[str]
             year = int(published[:4])
 
         results.append({
-            'title': info.get('title'),
-            'authors': info.get('authors') or [],
+            'title': catalogue_title_case(info.get('title')),
+            'authors': catalogue_names(info.get('authors')),
             'publish_year': year,
             'edition_keys': [],
             'isbns': isbns,
@@ -2759,7 +2853,7 @@ def _google_search(title: Optional[str], author: Optional[str], q: Optional[str]
             'editions': [{
                 'olid': None,
                 'google_id': item.get('id'),
-                'title': full_title,
+                'title': catalogue_title_case(full_title),
                 'publish_date': published or None,
                 'publishers': [info['publisher']] if info.get('publisher') else [],
                 'number_of_pages': info.get('pageCount'),
@@ -2858,7 +2952,8 @@ def search_openlibrary(title: Optional[str] = None, author: Optional[str] = None
 
                 editions_meta.append({
                     'olid': olid,
-                    'title': _edition_title(entry, detail, doc.get('title')),
+                    'title': catalogue_title_case(
+                        _edition_title(entry, detail, doc.get('title'))),
                     'publish_date': detail.get('publish_date') or entry.get('publish_date'),
                     'publishers': publishers,
                     'number_of_pages': detail.get('number_of_pages') or entry.get('number_of_pages'),
@@ -2869,8 +2964,8 @@ def search_openlibrary(title: Optional[str] = None, author: Optional[str] = None
                 })
 
         results.append({
-            'title': doc.get('title'),
-            'authors': doc.get('author_name', []),
+            'title': catalogue_title_case(doc.get('title')),
+            'authors': catalogue_names(doc.get('author_name')),
             'publish_year': doc.get('first_publish_year') or (doc.get('publish_year') and doc.get('publish_year')[0]),
             'edition_keys': edition_keys,
             'isbns': list(dict.fromkeys(isbns)),
@@ -2946,8 +3041,9 @@ def get_edition(olid: str, current_user: dict = Depends(get_current_user)):
         return {}
     item = data[key]
     return {
-        "title": item.get("title"),
-        "authors": [a.get("name") for a in item.get("authors", [])],
+        "title": catalogue_title_case(item.get("title")),
+        "authors": catalogue_names(
+            author.get("name") for author in item.get("authors", [])),
         "publish_date": item.get("publish_date"),
         "isbns": item.get("identifiers", {}).get("isbn_10") or item.get("identifiers", {}).get("isbn_13") or item.get("identifiers", {}).get("isbn") or []
     }
@@ -2966,9 +3062,10 @@ def lookup_isbn(isbn: str, current_user: dict = Depends(get_current_user)):
         item = None
 
     if item:
-        authors = [a.get("name") for a in item.get("authors", [])]
+        authors = catalogue_names(
+            author.get("name") for author in item.get("authors", []))
         return {
-            "title": item.get("title"),
+            "title": catalogue_title_case(item.get("title")),
             "authors": authors,
             "publish_date": item.get("publish_date"),
             "olid": clean_olid(item.get("key")) or _lookup_olid_by_isbn(isbn),
@@ -2987,8 +3084,9 @@ def lookup_isbn(isbn: str, current_user: dict = Depends(get_current_user)):
     title = info.get("title")
     subtitle = info.get("subtitle")
     return {
-        "title": f"{title}: {subtitle}" if title and subtitle else title,
-        "authors": info.get("authors") or [],
+        "title": catalogue_title_case(
+            f"{title}: {subtitle}" if title and subtitle else title),
+        "authors": catalogue_names(info.get("authors")),
         "publish_date": info.get("publishedDate"),
         # Google has no OpenLibrary id, but OpenLibrary may still know the
         # edition even when its books API returned nothing useful.

@@ -67,6 +67,49 @@ class AppClipCheckoutTests(unittest.TestCase):
         self.assertEqual([book.copy_count for book in books], [1, 1])
         self.assertEqual(main.matching_edition_ids(books[0].id), [books[0].id])
 
+    def test_catalogue_title_case_keeps_small_words_lowercase(self):
+        self.assertEqual(
+            main.catalogue_title_case("Sunset of the sabertooth"),
+            "Sunset of the Sabertooth",
+        )
+        self.assertEqual(
+            main.catalogue_title_case("the lion, the witch and the wardrobe"),
+            "The Lion, the Witch and the Wardrobe",
+        )
+        self.assertEqual(
+            main.catalogue_title_case("journey to iPhone island: rise of NASA"),
+            "Journey to iPhone Island: Rise of NASA",
+        )
+
+    def test_catalogue_name_case_preserves_name_particles_and_custom_case(self):
+        self.assertEqual(
+            main.catalogue_name_case("mary pope osborne"),
+            "Mary Pope Osborne",
+        )
+        self.assertEqual(
+            main.catalogue_name_case("alexandre dumas de la cruz"),
+            "Alexandre Dumas de la Cruz",
+        )
+        self.assertEqual(main.catalogue_name_case("sean o'brien"), "Sean O'Brien")
+        self.assertEqual(main.catalogue_name_case("Maggie O'Farrell"), "Maggie O'Farrell")
+
+    def test_manual_metadata_casing_is_preserved(self):
+        added = main.add_book(
+            main.Book(
+                title="manually cased title",
+                author="e. e. cummings",
+                isbn="123456789X",
+                format="Other",
+                series="my manually cased saga",
+            ),
+            main.BackgroundTasks(),
+            current_user={"username": "test", "role": main.ROLE_ADMIN},
+        )
+
+        self.assertEqual(added.title, "manually cased title")
+        self.assertEqual(added.author, "e. e. cummings")
+        self.assertEqual(added.series, "my manually cased saga")
+
     def test_guest_flags_fail_closed(self):
         os.environ["TEST_GUEST_FLAG"] = "flase"
         self.assertFalse(main.enabled_env("TEST_GUEST_FLAG"))
