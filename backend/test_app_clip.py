@@ -36,6 +36,37 @@ class AppClipCheckoutTests(unittest.TestCase):
         self.assertEqual(main.isbn_equivalents("0306406153"), set())
         self.assertEqual(main.isbn_equivalents("9780306406158"), set())
 
+    def test_missing_isbn_placeholder_is_not_used_for_duplicate_matching(self):
+        self.assertIsNone(main.duplicate_isbn("0000000000"))
+        self.assertIsNone(main.duplicate_isbn("000-000-000-0"))
+        self.assertEqual(main.duplicate_isbn("0-306-40615-2"), "0306406152")
+
+        user = {"username": "test", "role": main.ROLE_ADMIN}
+        main.add_book(
+            main.Book(
+                title="First unnumbered book",
+                author="First Author",
+                isbn="0000000000",
+                format="Other",
+            ),
+            main.BackgroundTasks(),
+            current_user=user,
+        )
+        main.add_book(
+            main.Book(
+                title="Second unnumbered book",
+                author="Second Author",
+                isbn="000-000-000-0",
+                format="Other",
+            ),
+            main.BackgroundTasks(),
+            current_user=user,
+        )
+
+        books = main.list_books(current_user=user)
+        self.assertEqual([book.copy_count for book in books], [1, 1])
+        self.assertEqual(main.matching_edition_ids(books[0].id), [books[0].id])
+
     def test_guest_flags_fail_closed(self):
         os.environ["TEST_GUEST_FLAG"] = "flase"
         self.assertFalse(main.enabled_env("TEST_GUEST_FLAG"))

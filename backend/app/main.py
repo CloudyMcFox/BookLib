@@ -101,6 +101,16 @@ def clean(value: Optional[str]) -> Optional[str]:
     return stripped or None
 
 
+def duplicate_isbn(value: Optional[str]) -> Optional[str]:
+    """Return the normalized ISBN used for copy matching.
+
+    Ten zeroes is the explicit placeholder for a book without an ISBN, so each
+    use represents an unrelated book rather than another copy.
+    """
+    normalized = re.sub(r'[-\s]', '', value or '')
+    return normalized if normalized and normalized != '0000000000' else None
+
+
 def clean_olid(value: Optional[str]) -> Optional[str]:
     """Normalise an OpenLibrary edition id, accepting '/books/OL123M' or a bare
     'ol123m'. Returns None when no valid id is present."""
@@ -608,7 +618,8 @@ conn.commit()
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
 BOOK_COLUMNS = ("id, title, author, isbn, olid, google_id, notes, format, series, series_index, "
                 "description, created_at, shelf_id, shelf_column, shelf_row, borrower_name, checked_out_at, "
-                """CASE WHEN isbn IS NULL OR TRIM(isbn)='' THEN 1 ELSE
+                """CASE WHEN isbn IS NULL OR TRIM(isbn)='' OR
+                              REPLACE(REPLACE(isbn, '-', ''), ' ', '')='0000000000' THEN 1 ELSE
                    (SELECT COUNT(*) FROM books AS copies
                     WHERE REPLACE(REPLACE(copies.isbn, '-', ''), ' ', '') =
                           REPLACE(REPLACE(books.isbn, '-', ''), ' ', ''))
@@ -644,7 +655,7 @@ def now_iso() -> str:
 
 
 def _edition_identity(title: Optional[str], author: Optional[str], isbn: Optional[str]) -> tuple:
-    return (_normalized(title), _normalized(author), re.sub(r'[^0-9Xx]', '', isbn or '').lower())
+    return (_normalized(title), _normalized(author), duplicate_isbn(isbn) or '')
 
 
 def matching_edition_ids(book_id: int) -> List[int]:
@@ -1981,7 +1992,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         source = conn.execute("SELECT isbn FROM books WHERE id=?", (copies_of,)).fetchone()
         if not source:
             raise HTTPException(status_code=404, detail="Not found")
-        normalized_isbn = re.sub(r'[^0-9Xx]', '', source['isbn'] or '').lower()
+        normalized_isbn = duplicate_isbn(source['isbn'])
         if not normalized_isbn:
             where.append("id = ?")
             params.append(copies_of)
@@ -1989,7 +2000,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
             copy_ids = [
                 row['id'] for row in conn.execute(
                     "SELECT id, isbn FROM books WHERE isbn IS NOT NULL AND isbn <> ''").fetchall()
-                if re.sub(r'[^0-9Xx]', '', row['isbn']).lower() == normalized_isbn
+                if duplicate_isbn(row['isbn']) == normalized_isbn
             ]
             where.append("id IN (" + ",".join("?" * len(copy_ids)) + ")")
             params.extend(copy_ids)
@@ -2186,12 +2197,12 @@ def add_book(b: Book, background_tasks: BackgroundTasks,
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
     b.title, b.author, b.isbn, b.notes = title, clean(b.author), clean(b.isbn), clean(b.notes)
-    normalized_isbn = re.sub(r'[-\s]', '', b.isbn or '')
+    normalized_isbn = duplicate_isbn(b.isbn)
     if normalized_isbn and not allow_duplicate:
         existing = next((
             row for row in conn.execute(
                 "SELECT id, title, author, isbn FROM books WHERE isbn IS NOT NULL AND isbn <> ''").fetchall()
-            if re.sub(r'[-\s]', '', row['isbn']) == normalized_isbn
+            if duplicate_isbn(row['isbn']) == normalized_isbn
         ), None)
         if existing:
             raise HTTPException(status_code=409, detail={
@@ -2230,12 +2241,12 @@ def add_book(b: Book, background_tasks: BackgroundTasks,
     # rest of the optional enrichment in the background.
     supplied = normalize_tags(b.tags)
     b.tags = set_book_tags(b.id, supplied) if supplied else []
-    if b.isbn:
-        normalized_isbn = re.sub(r'[-\s]', '', b.isbn)
+    normalized_isbn = duplicate_isbn(b.isbn)
+    if normalized_isbn:
         b.copy_count = sum(
             1 for row in conn.execute(
                 "SELECT isbn FROM books WHERE isbn IS NOT NULL AND isbn <> ''").fetchall()
-            if re.sub(r'[-\s]', '', row['isbn']) == normalized_isbn
+            if duplicate_isbn(row['isbn']) == normalized_isbn
         )
     add_other_edition_counts([b])
     background_tasks.add_task(
