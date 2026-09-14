@@ -110,6 +110,34 @@ class AppClipCheckoutTests(unittest.TestCase):
         self.assertEqual(added.author, "e. e. cummings")
         self.assertEqual(added.series, "my manually cased saga")
 
+    def test_duplicate_filter_groups_repeated_isbns_and_ignores_placeholder(self):
+        main.conn.executemany(
+            "INSERT INTO books (title, author, isbn) VALUES (?, ?, ?)",
+            [
+                ("Zulu copy", "Author", "978-1-23456-789-7"),
+                ("Unrelated", "Author", "9781111111113"),
+                ("Alpha copy", "Author", "9781234567897"),
+                ("Missing one", "Author", "0000000000"),
+                ("Missing two", "Author", "000-000-000-0"),
+                ("Second group A", "Author", "9782222222226"),
+                ("Second group B", "Author", "9782222222226"),
+            ],
+        )
+        main.conn.commit()
+
+        books = main.list_books(
+            duplicates_only=True,
+            sort="title",
+            dir="asc",
+            current_user={"username": "test", "role": main.ROLE_ADMIN},
+        )
+
+        self.assertEqual(
+            [main.duplicate_isbn(book.isbn) for book in books],
+            ["9781234567897", "9781234567897", "9782222222226", "9782222222226"],
+        )
+        self.assertEqual([book.copy_count for book in books], [2, 2, 2, 2])
+
     def test_guest_flags_fail_closed(self):
         os.environ["TEST_GUEST_FLAG"] = "flase"
         self.assertFalse(main.enabled_env("TEST_GUEST_FLAG"))

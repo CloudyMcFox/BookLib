@@ -2015,6 +2015,7 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
                format: Optional[str] = None, has_format: Optional[bool] = None,
                series: Optional[str] = None, has_series: Optional[bool] = None,
                checked_out: Optional[bool] = None,
+               duplicates_only: bool = False,
                edition_of: Optional[int] = None,
                copies_of: Optional[int] = None,
                current_user: dict = Depends(get_current_user)):
@@ -2026,7 +2027,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     ?placed=false to find books with no location yet, ?format= to limit to one
     binding, ?has_format=false to find the books still missing one, ?series= to
     limit to one series, ?has_series=false for the standalones, and
-    ?checked_out=true|false to filter by circulation status."""
+    ?checked_out=true|false to filter by circulation status. ?duplicates_only=true
+    returns only repeated ISBNs and keeps each group together."""
     order = order_by(sort, dir)
     where = []
     params: List = []
@@ -2074,6 +2076,19 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
 
     if checked_out is not None:
         where.append("checked_out_at IS NOT NULL" if checked_out else "checked_out_at IS NULL")
+
+    if duplicates_only:
+        where.append(
+            """isbn IS NOT NULL AND TRIM(isbn) <> ''
+               AND REPLACE(REPLACE(isbn, '-', ''), ' ', '') <> '0000000000'
+               AND (SELECT COUNT(*) FROM books AS copies
+                    WHERE REPLACE(REPLACE(copies.isbn, '-', ''), ' ', '') =
+                          REPLACE(REPLACE(books.isbn, '-', ''), ' ', '')) > 1"""
+        )
+        order = (
+            " ORDER BY REPLACE(REPLACE(books.isbn, '-', ''), ' ', '') COLLATE NOCASE ASC, "
+            + order.removeprefix(" ORDER BY ")
+        )
 
     if edition_of is not None:
         edition_ids = matching_edition_ids(edition_of)

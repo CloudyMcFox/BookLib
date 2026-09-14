@@ -2024,6 +2024,7 @@ export default function App(){
   const [seriesInUse,setSeriesInUse]=useState([])
   const [editionFilter,setEditionFilter]=useState(null)
   const [copyFilter,setCopyFilter]=useState(null)
+  const [duplicatesOnly,setDuplicatesOnly]=useState(false)
   const [tagMatch,setTagMatch]=useState('all')
   const [refreshing,setRefreshing]=useState(null)
   const [shelves,setShelves]=useState([])
@@ -2051,7 +2052,8 @@ export default function App(){
     const term = t(query===undefined ? q : query)
     const s = sortOverride || sort
     const f = {tags: selectedTags, excludes: excludedTags, match: tagMatch,
-               shelf: shelfFilter, edition: editionFilter, copies: copyFilter, ...(filterOverride || {})}
+               shelf: shelfFilter, edition: editionFilter, copies: copyFilter,
+               duplicates: duplicatesOnly, ...(filterOverride || {})}
     const fmt = f.format===undefined ? formatFilter : f.format
     const ser = f.series===undefined ? seriesFilter : f.series
     const params = [`sort=${s.field}`, `dir=${s.dir}`]
@@ -2075,6 +2077,7 @@ export default function App(){
     else if(ser) params.push('series=' + encodeURIComponent(ser))
     if(f.edition) params.push('edition_of=' + encodeURIComponent(f.edition.id))
     if(f.copies) params.push('copies_of=' + encodeURIComponent(f.copies.id))
+    if(f.duplicates) params.push('duplicates_only=true')
     const res = await fetch(API_BASE + '/books?' + params.join('&'), {headers: authHeaders()})
     if(res.status===401){ setLoggedIn(false); return }
     if(!res.ok){
@@ -2144,6 +2147,13 @@ export default function App(){
     fetchBooks(undefined, undefined, {series: value})
   }
 
+  const changeDuplicatesFilter = (enabled)=>{
+    setDuplicatesOnly(enabled)
+    setEditionFilter(null)
+    setCopyFilter(null)
+    fetchBooks(undefined, undefined, {duplicates: enabled, edition: null, copies: null})
+  }
+
   const showSeries = (value)=>{
     setTab('manage')
     setQ('')
@@ -2152,9 +2162,10 @@ export default function App(){
     setFormatFilter('')
     setShelfFilter('')
     setSeriesFilter(value)
+    setDuplicatesOnly(false)
     setEditionFilter(null)
     setCopyFilter(null)
-    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value, edition: null, copies: null})
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value, duplicates: false, edition: null, copies: null})
   }
 
   const showEditions = (book)=>{
@@ -2165,9 +2176,10 @@ export default function App(){
     setFormatFilter('')
     setShelfFilter('')
     setSeriesFilter('')
+    setDuplicatesOnly(false)
     setEditionFilter({id: book.id, title: book.title})
     setCopyFilter(null)
-    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', edition: {id: book.id}, copies: null})
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', duplicates: false, edition: {id: book.id}, copies: null})
   }
 
   const showCopies = (book)=>{
@@ -2178,9 +2190,10 @@ export default function App(){
     setFormatFilter('')
     setShelfFilter('')
     setSeriesFilter('')
+    setDuplicatesOnly(false)
     setEditionFilter(null)
     setCopyFilter({id: book.id, title: book.title, count: book.copy_count})
-    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', edition: null, copies: {id: book.id}})
+    fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: '', duplicates: false, edition: null, copies: {id: book.id}})
   }
 
   const clearTagFilter = ()=>{
@@ -2437,7 +2450,7 @@ export default function App(){
     fetchFormats()
   }
 
-  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setExcludedTags([]); setFormatFilter(''); setShelfFilter(''); setFormatsInUse([]); setEditionFilter(null); setCopyFilter(null) }
+  const logout = ()=>{ localStorage.removeItem('token'); setLoggedIn(false); setMe(null); setBooks([]); setRecent([]); setAllTags([]); setSelectedTags([]); setExcludedTags([]); setFormatFilter(''); setShelfFilter(''); setFormatsInUse([]); setEditionFilter(null); setCopyFilter(null); setDuplicatesOnly(false) }
 
   return (
     <ReadOnlyContext.Provider value={readOnly}>
@@ -2532,6 +2545,11 @@ export default function App(){
                   {seriesInUse.map(s=> <option key={s.name} value={s.name}>{s.name} ({s.count})</option>)}
                   <option value="__none__">Standalone</option>
                 </select>
+                <label className="inline-check" title="Show every ISBN with more than one copy">
+                  <input type="checkbox" checked={duplicatesOnly}
+                         onChange={e=>changeDuplicatesFilter(e.target.checked)} />
+                  Duplicates only
+                </label>
               </form>
               {libraryError && <div className="alert">{libraryError}</div>}
               {editionFilter && (
