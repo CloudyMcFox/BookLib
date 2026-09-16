@@ -138,6 +138,47 @@ class AppClipCheckoutTests(unittest.TestCase):
         )
         self.assertEqual([book.copy_count for book in books], [2, 2, 2, 2])
 
+    def test_duplicate_book_copies_metadata_but_not_checkout(self):
+        main.conn.execute(
+            """INSERT INTO books
+               (title, author, isbn, notes, format, series, series_index,
+                description, cover, cover_mime, created_at, shelf_id,
+                shelf_column, shelf_row, borrower_name, checked_out_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "Copy me", "An Author", "9781234567897", "A note", "Hardcover",
+                "A Series", 2, "A description", b"cover bytes", "image/jpeg",
+                "2026-01-01T00:00:00Z", 1, 2, 3, "Reader",
+                "2026-09-01T00:00:00Z",
+            ),
+        )
+        source_id = main.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        main.conn.execute("INSERT INTO tags (name) VALUES (?)", ("Adventure",))
+        tag_id = main.conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        main.conn.execute(
+            "INSERT INTO book_tags (book_id, tag_id) VALUES (?, ?)",
+            (source_id, tag_id),
+        )
+        main.conn.commit()
+
+        duplicate = main.duplicate_book(
+            source_id,
+            current_user={"username": "test", "role": main.ROLE_ADMIN},
+        )
+        stored = main.conn.execute(
+            "SELECT * FROM books WHERE id=?", (duplicate.id,)
+        ).fetchone()
+
+        self.assertNotEqual(duplicate.id, source_id)
+        self.assertEqual(duplicate.title, "Copy me")
+        self.assertEqual(duplicate.tags, ["Adventure"])
+        self.assertEqual(duplicate.copy_count, 2)
+        self.assertEqual(stored["cover"], b"cover bytes")
+        self.assertEqual((stored["shelf_id"], stored["shelf_column"], stored["shelf_row"]), (1, 2, 3))
+        self.assertIsNone(stored["borrower_name"])
+        self.assertIsNone(stored["checked_out_at"])
+        self.assertNotEqual(stored["created_at"], "2026-01-01T00:00:00Z")
+
     def test_guest_flags_fail_closed(self):
         os.environ["TEST_GUEST_FLAG"] = "flase"
         self.assertFalse(main.enabled_env("TEST_GUEST_FLAG"))
