@@ -2242,6 +2242,36 @@ def delete_book(book_id: int, current_user: dict = Depends(require_editor)):
     conn.commit()
     return {"deleted": cur.rowcount}
 
+@app.post("/books/{book_id}/duplicate", response_model=Book)
+def duplicate_book(book_id: int, current_user: dict = Depends(require_editor)):
+    """Create another available physical copy with the same stored metadata."""
+    source = conn.execute("SELECT id FROM books WHERE id=?", (book_id,)).fetchone()
+    if not source:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    cur = conn.execute(
+        """INSERT INTO books
+           (title, author, isbn, olid, google_id, notes, format, series,
+            series_index, description, cover, cover_mime, created_at,
+            shelf_id, shelf_column, shelf_row)
+           SELECT title, author, isbn, olid, google_id, notes, format, series,
+                  series_index, description, cover, cover_mime, ?,
+                  shelf_id, shelf_column, shelf_row
+           FROM books WHERE id=?""",
+        (now_iso(), book_id),
+    )
+    new_id = cur.lastrowid
+    conn.execute(
+        """INSERT INTO book_tags (book_id, tag_id)
+           SELECT ?, tag_id FROM book_tags WHERE book_id=?""",
+        (new_id, book_id),
+    )
+    conn.commit()
+
+    row = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (new_id,)).fetchone()
+    return book_from_row(row, tags_for_books([new_id]).get(new_id, []))
+
+
 @app.put("/books/{book_id}", response_model=Book)
 def update_book(book_id: int, b: Book, current_user: dict = Depends(require_editor)):
     """Update an existing book. All fields in the payload will overwrite stored
