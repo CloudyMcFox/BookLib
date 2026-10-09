@@ -722,8 +722,12 @@ BOOK_COLUMNS = ("id, title, author, isbn, olid, google_id, notes, format, series
 
 # Whitelisted ORDER BY clauses, so the sort parameter can never be injected.
 # Books added before created_at existed sort by id, which preserves insert order.
+TITLE_SORT_SQL = (
+    "CASE WHEN LOWER(SUBSTR(title, 1, 4))='the ' THEN SUBSTR(title, 5) ELSE title END "
+    "COLLATE NOCASE {dir}, title COLLATE NOCASE {dir}"
+)
 SORT_CLAUSES = {
-    'title': "title COLLATE NOCASE {dir}, id {dir}",
+    'title': TITLE_SORT_SQL + ", id {dir}",
     'author': "CASE WHEN author IS NULL OR author='' THEN 1 ELSE 0 END, author COLLATE NOCASE {dir}, id {dir}",
     'added': "COALESCE(created_at,'') {dir}, id {dir}",
     # Unplaced books sort last either way, so the list does not open on a block
@@ -733,7 +737,7 @@ SORT_CLAUSES = {
     # number, and books with no series go last either way.
     'series': ("CASE WHEN series IS NULL OR series='' THEN 1 ELSE 0 END, series COLLATE NOCASE {dir}, "
                "CASE WHEN series_index IS NULL THEN 1 ELSE 0 END, series_index {dir}, "
-               "title COLLATE NOCASE {dir}, id {dir}"),
+               + TITLE_SORT_SQL + ", id {dir}"),
 }
 DEFAULT_SORT = 'added'
 

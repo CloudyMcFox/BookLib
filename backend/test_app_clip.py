@@ -110,6 +110,36 @@ class AppClipCheckoutTests(unittest.TestCase):
         self.assertEqual(added.author, "e. e. cummings")
         self.assertEqual(added.series, "my manually cased saga")
 
+    def test_title_sort_ignores_only_a_leading_the(self):
+        main.conn.executemany(
+            "INSERT INTO books (title) VALUES (?)",
+            [
+                ("There and Back Again",),
+                ("Banana Book",),
+                ("The Apple Book",),
+                ("Aardvark Book",),
+                ("the Cedar Book",),
+            ],
+        )
+        main.conn.commit()
+
+        books = main.list_books(
+            sort="title",
+            dir="asc",
+            current_user={"username": "test", "role": main.ROLE_ADMIN},
+        )
+
+        self.assertEqual(
+            [book.title for book in books],
+            [
+                "Aardvark Book",
+                "The Apple Book",
+                "Banana Book",
+                "the Cedar Book",
+                "There and Back Again",
+            ],
+        )
+
     def test_duplicate_filter_groups_repeated_isbns_and_ignores_placeholder(self):
         main.conn.executemany(
             "INSERT INTO books (title, author, isbn) VALUES (?, ?, ?)",
