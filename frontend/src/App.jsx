@@ -1998,6 +1998,271 @@ function BooksTable({books, onDelete, onSaved, onBookPatched, emptyText, sort, o
   )
 }
 
+// --- statistics ---
+// Worked out in the browser from the full book list: GET /books returns the
+// whole library in one response, so there is no separate stats endpoint.
+
+const STATS_PREVIEW = 10
+
+function countNames(names){
+  // Most first, then by name. Spellings differing only in case count together.
+  const counts = new Map()
+  for(const raw of names){
+    const name = t(raw)
+    if(!name) continue
+    const key = name.toLowerCase()
+    const entry = counts.get(key)
+    if(entry) entry.count += 1
+    else counts.set(key, {name, count: 1})
+  }
+  return [...counts.values()].sort((a,b)=> b.count-a.count || a.name.localeCompare(b.name, undefined, {sensitivity:'base'}))
+}
+
+function libraryStats(books, tagCounts, shelves){
+  const byTitle = [...books].sort((a,b)=> a.title.localeCompare(b.title, undefined, {sensitivity:'base'}))
+  const placed = b=> b.shelf_id!=null && b.shelf_column!=null && b.shelf_row!=null
+  const uniqueTitles = new Set(books.map(b=>{
+    const isbn = t(b.isbn).replace(/[^0-9Xx]/g,'').toUpperCase()
+    return isbn ? 'isbn:'+isbn : 'id:'+b.id
+  })).size
+
+  const allTags = countNames(books.flatMap(b=> b.tags || []))
+  let genres = null, tags = allTags
+  if(tagCounts.some(tc=> tc.genre!==undefined)){
+    const genreNames = new Set(tagCounts.filter(tc=> tc.genre).map(tc=> tc.name.toLowerCase()))
+    genres = allTags.filter(x=> genreNames.has(x.name.toLowerCase()))
+    tags = allTags.filter(x=> !genreNames.has(x.name.toLowerCase()))
+  }
+
+  // Books added per month for the last twelve months, oldest first.
+  const now = new Date()
+  const months = []
+  for(let i=11; i>=0; i--){
+    const d = new Date(now.getFullYear(), now.getMonth()-i, 1)
+    months.push({key: d.getFullYear()*12+d.getMonth(), label: d.toLocaleString(undefined, {month:'short'}), count: 0})
+  }
+  for(const b of books){
+    if(!b.created_at) continue
+    const d = new Date(b.created_at)
+    if(isNaN(d)) continue
+    const m = months.find(x=> x.key===d.getFullYear()*12+d.getMonth())
+    if(m) m.count += 1
+  }
+
+  const shelfFill = shelves.map(s=>{
+    const on = books.filter(b=> b.shelf_id===s.id && placed(b))
+    const used = new Set(on.map(b=> b.shelf_column+','+b.shelf_row)).size
+    const slots = s.columns*s.rows
+    return {shelf: s, books: on.length, used, slots, fraction: slots ? Math.min(used/slots, 1) : 0}
+  })
+
+  const loans = books.filter(isCheckedOut).sort((a,b)=>
+    (Date.parse(a.checked_out_at)||Infinity) - (Date.parse(b.checked_out_at)||Infinity))
+
+  return {
+    total: books.length, uniqueTitles,
+    authors: countNames(books.map(b=> b.author)),
+    series: countNames(books.map(b=> b.series)),
+    formats: countNames(books.map(b=> b.format)),
+    noFormat: byTitle.filter(b=> !t(b.format)),
+    placedCount: books.filter(placed).length,
+    genres, tags, months, shelfFill, loans,
+    missingCover: byTitle.filter(b=> !b.has_cover),
+    missingTags: byTitle.filter(b=> !(b.tags && b.tags.length)),
+    missingLocation: byTitle.filter(b=> !placed(b)),
+  }
+}
+
+function StatTile({value, label, detail}){
+  return (
+    <div className="stat-tile">
+      <div className="stat-value">{value.toLocaleString()}</div>
+      <div className="stat-label">{label}</div>
+      {detail && <div className="stat-detail">{detail}</div>}
+    </div>
+  )
+}
+
+function CountBars({title, items, empty, onPick, extra}){
+  const [showAll,setShowAll] = useState(false)
+  const shown = showAll ? items : items.slice(0, STATS_PREVIEW)
+  const max = Math.max(1, ...items.map(x=> x.count), extra ? extra.count : 0)
+  return (
+    <div className="card stats-card">
+      <h3>{title}</h3>
+      {!items.length && !extra && <div className="muted">{empty}</div>}
+      {shown.map(item=>(
+        <button type="button" key={item.name} className="count-bar" onClick={()=> onPick(item.name)}
+                title={`Show these ${item.count} book${item.count===1?'':'s'} in Manage`}>
+          <span className="count-bar-name">{item.name}</span>
+          <span className="count-bar-count">{item.count}</span>
+          <span className="count-bar-track"><span className="count-bar-fill" style={{width: `${Math.max(2, item.count/max*100)}%`}} /></span>
+        </button>
+      ))}
+      {extra && (
+        <button type="button" className="count-bar muted-bar" onClick={extra.onPick}>
+          <span className="count-bar-name">{extra.name}</span>
+          <span className="count-bar-count">{extra.count}</span>
+          <span className="count-bar-track"><span className="count-bar-fill" style={{width: `${Math.max(2, extra.count/max*100)}%`}} /></span>
+        </button>
+      )}
+      {items.length>STATS_PREVIEW && (
+        <button type="button" className="link-button" onClick={()=> setShowAll(!showAll)}>
+          {showAll ? 'Show fewer' : `Show all ${items.length}`}
+        </button>
+      )}
+    </div>
+  )
+}
+
+function AttentionRow({label, books, onShow}){
+  const [open,setOpen] = useState(false)
+  if(!books.length) return <li><span>{label}</span><span className="attention-ok">None ✓</span></li>
+  return (
+    <li>
+      <span>{label}</span>
+      {onShow
+        ? <button type="button" className="link-button" onClick={onShow}>{books.length} — show in Manage</button>
+        : <button type="button" className="link-button" onClick={()=> setOpen(!open)}>{books.length} — {open ? 'hide' : 'list'}</button>}
+      {open && <ul className="attention-titles">{books.map(b=> <li key={b.id}>{b.title}{b.author ? <span className="muted"> · {b.author}</span> : null}</li>)}</ul>}
+    </li>
+  )
+}
+
+function StatsPanel({onShow}){
+  const readOnly = useReadOnly()
+  const [stats,setStats] = useState(null)
+  const [error,setError] = useState(null)
+
+  const load = async ()=>{
+    setError(null)
+    try{
+      const get = async (path, required)=>{
+        const res = await fetch(API_BASE + path, {headers: authHeaders()})
+        if(!res.ok){
+          if(required) throw new Error(await readError(res))
+          return []
+        }
+        return res.json()
+      }
+      const [books, tagCounts, shelves] = await Promise.all([
+        get('/books?sort=title&dir=asc', true),
+        get('/tags', false),
+        readOnly ? Promise.resolve([]) : get('/shelves', false),
+      ])
+      setStats(libraryStats(books, tagCounts, shelves))
+    }catch(e){
+      setError(String(e.message || e))
+    }
+  }
+  useEffect(()=>{ load() }, [readOnly])
+
+  if(error) return <div className="card"><div className="alert">{error}</div><button type="button" onClick={load}>Try again</button></div>
+  if(!stats) return <div className="card" style={{color:'#666'}}>Loading statistics...</div>
+
+  const pct = n=> stats.total ? ` (${Math.round(n/stats.total*100)}%)` : ''
+  const monthMax = Math.max(1, ...stats.months.map(m=> m.count))
+  const addedThisYear = stats.months.reduce((n,m)=> n+m.count, 0)
+  const daysOut = b=>{
+    const d = Date.parse(b.checked_out_at)
+    return isNaN(d) ? null : Math.floor((Date.now()-d)/86400000)
+  }
+
+  return (
+    <>
+      <div className="card">
+        <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+          <h3 style={{margin:0}}>Statistics</h3>
+          <button type="button" onClick={load}>Refresh</button>
+        </div>
+        <div className="stat-tiles">
+          <StatTile value={stats.total} label="Books" detail={stats.uniqueTitles!==stats.total ? `${stats.uniqueTitles} unique titles` : null} />
+          <StatTile value={stats.authors.length} label="Authors" />
+          <StatTile value={stats.series.length} label="Series" />
+          {!readOnly && <StatTile value={stats.placedCount} label="On a bookshelf" detail={pct(stats.placedCount).trim() || null} />}
+          {!readOnly && <StatTile value={stats.loans.length} label="Checked out" />}
+          <StatTile value={addedThisYear} label="Added in 12 months" />
+        </div>
+      </div>
+
+      <div className="stats-grid">
+        {stats.genres ? (
+          <>
+            <CountBars title="Genres" items={stats.genres} empty="No genre tags yet." onPick={name=> onShow({tags:[name]})} />
+            <CountBars title="Other tags" items={stats.tags} empty="No other tags." onPick={name=> onShow({tags:[name]})} />
+          </>
+        ) : (
+          <CountBars title="Tags" items={stats.tags} empty="No tags yet." onPick={name=> onShow({tags:[name]})} />
+        )}
+        <CountBars title="Formats" items={stats.formats} empty="No formats recorded." onPick={name=> onShow({format:name})}
+                   extra={stats.noFormat.length ? {name:'No format', count: stats.noFormat.length, onPick: ()=> onShow({format:'__none__'})} : null} />
+        <CountBars title="Top authors" items={stats.authors} empty="No authors recorded." onPick={name=> onShow({q:name})} />
+        <CountBars title="Biggest series" items={stats.series} empty="No series recorded." onPick={name=> onShow({series:name})} />
+
+        <div className="card stats-card">
+          <h3>Added per month</h3>
+          <div className="month-chart" role="img" aria-label={`Books added per month over the last 12 months, ${addedThisYear} in total`}>
+            {stats.months.map(m=>(
+              <div key={m.key} className="month-col" title={`${m.label}: ${m.count}`}>
+                <span className="month-count">{m.count || ''}</span>
+                <span className="month-bar" style={{height: `${m.count/monthMax*100}%`}} />
+                <span className="month-label">{m.label}</span>
+              </div>
+            ))}
+          </div>
+          <div className="muted" style={{marginTop:6}}>By the date each book was added to BookLib.</div>
+        </div>
+
+        {!readOnly && stats.shelfFill.length>0 && (
+          <div className="card stats-card">
+            <h3>Bookshelves</h3>
+            {stats.shelfFill.map(f=>(
+              <button type="button" key={f.shelf.id} className="count-bar" onClick={()=> onShow({shelf:String(f.shelf.id)})}>
+                <span className="count-bar-name">{f.shelf.name}</span>
+                <span className="count-bar-count">{f.books} book{f.books===1?'':'s'} · {f.used}/{f.slots} slots</span>
+                <span className="count-bar-track"><span className="count-bar-fill" style={{width: `${Math.max(2, f.fraction*100)}%`}} /></span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {!readOnly && (
+          <div className="card stats-card">
+            <h3>Lending</h3>
+            {!stats.loans.length ? <div className="muted">Nothing is checked out.</div> : (
+              <ul className="loan-list">
+                {stats.loans.map(b=>{
+                  const days = daysOut(b)
+                  return (
+                    <li key={b.id}>
+                      <span className="loan-title">{b.title}</span>
+                      <span className="loan-meta">{b.borrower_name || 'Unknown borrower'}
+                        {days!=null && <> · <span className={days>=30 ? 'loan-overdue' : ''}>{days===0 ? 'today' : days===1 ? '1 day' : `${days} days`}</span></>}
+                      </span>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {!readOnly && (
+          <div className="card stats-card">
+            <h3>Needs attention</h3>
+            <ul className="attention-list">
+              <AttentionRow label="No cover" books={stats.missingCover} />
+              <AttentionRow label="No tags" books={stats.missingTags} />
+              <AttentionRow label="No format" books={stats.noFormat} onShow={()=> onShow({format:'__none__'})} />
+              <AttentionRow label="No location" books={stats.missingLocation} onShow={()=> onShow({shelf:'__unplaced__'})} />
+            </ul>
+          </div>
+        )}
+      </div>
+    </>
+  )
+}
+
 export default function App(){
   const [tab,setTab]=useState('add')
   const [books,setBooks]=useState([])
@@ -2166,6 +2431,24 @@ export default function App(){
     setEditionFilter(null)
     setCopyFilter(null)
     fetchBooks('', undefined, {tags: [], excludes: [], format: '', shelf: '', series: value, duplicates: false, edition: null, copies: null})
+  }
+
+  // From the statistics: open Manage narrowed to exactly what was clicked.
+  const showFromStats = ({q: query='', tags=[], format='', shelf='', series=''})=>{
+    setTab('manage')
+    setQ(query)
+    setSelectedTags(tags)
+    setExcludedTags([])
+    setTagMatch('all')
+    setFormatFilter(format)
+    setShelfFilter(shelf)
+    setSeriesFilter(series)
+    setDuplicatesOnly(false)
+    setEditionFilter(null)
+    setCopyFilter(null)
+    fetchBooks(query, undefined, {tags, excludes: [], match: 'all', format, shelf, series, duplicates: false, edition: null, copies: null})
+    fetchTags(); fetchFormats(); fetchSeries()
+    if(!readOnly) fetchShelves()
   }
 
   const showEditions = (book)=>{
@@ -2498,9 +2781,12 @@ export default function App(){
             <button className={tab==='manage'? 'tab active':'tab'} onClick={()=>{ setTab('manage'); fetchBooks(); fetchTags(); fetchShelves(); fetchFormats(); fetchSeries() }}>{readOnly ? 'Browse' : 'Manage'}</button>
             <button className={tab==='checkout'? 'tab active':'tab'} onClick={()=>setTab('checkout')}>Checkout</button>
             {!readOnly && <button className={tab==='shelves'? 'tab active':'tab'} onClick={()=>{ setTab('shelves'); fetchShelves() }}>Bookshelf</button>}
+            <button className={tab==='stats'? 'tab active':'tab'} onClick={()=>setTab('stats')}>Statistics</button>
           </div>
 
-          {tab==='shelves' ? (
+          {tab==='stats' ? (
+            <StatsPanel onShow={showFromStats} />
+          ) : tab==='shelves' ? (
             <>
               <BookshelfBrowser shelves={shelves} refreshToken={locationVersion}
                                 onPlace={setPlacing} onDelete={handleDelete}
