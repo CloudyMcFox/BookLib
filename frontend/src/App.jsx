@@ -2129,9 +2129,20 @@ function AttentionRow({label, books, onShow}){
   )
 }
 
-function StatsPanel({onShow}){
+// Which books the statistics cover: '' is every book, '__unplaced__' the books
+// on no bookshelf, anything else a bookshelf id. The same values Manage's
+// shelf filter uses, so a click carries the choice straight across.
+function inStatsScope(book, scope){
+  const placed = book.shelf_id!=null && book.shelf_column!=null && book.shelf_row!=null
+  if(!scope) return true
+  if(scope==='__unplaced__') return !placed
+  return placed && String(book.shelf_id)===scope
+}
+
+function StatsPanel({onShow: showInManage}){
   const readOnly = useReadOnly()
-  const [stats,setStats] = useState(null)
+  const [data,setData] = useState(null)
+  const [scope,setScope] = useState('')
   const [error,setError] = useState(null)
 
   const load = async ()=>{
@@ -2150,7 +2161,9 @@ function StatsPanel({onShow}){
         get('/tags', false),
         readOnly ? Promise.resolve([]) : get('/shelves', false),
       ])
-      setStats(libraryStats(books, tagCounts, shelves))
+      setData({books, tagCounts, shelves})
+      // A bookshelf deleted since the last load leaves nothing to show.
+      if(scope && scope!=='__unplaced__' && !shelves.some(s=> String(s.id)===scope)) setScope('')
     }catch(e){
       setError(String(e.message || e))
     }
@@ -2158,7 +2171,15 @@ function StatsPanel({onShow}){
   useEffect(()=>{ load() }, [readOnly])
 
   if(error) return <div className="card"><div className="alert">{error}</div><button type="button" onClick={load}>Try again</button></div>
-  if(!stats) return <div className="card" style={{color:'#666'}}>Loading statistics...</div>
+  if(!data) return <div className="card" style={{color:'#666'}}>Loading statistics...</div>
+
+  const shownShelves = !scope ? data.shelves
+    : scope==='__unplaced__' ? [] : data.shelves.filter(s=> String(s.id)===scope)
+  const stats = libraryStats(data.books.filter(b=> inStatsScope(b, scope)), data.tagCounts, shownShelves)
+  // A click keeps the bookshelf chosen here unless it names one itself.
+  const onShow = filter=> showInManage({shelf: scope, ...filter})
+  const scopeName = scope==='__unplaced__' ? 'books not on a bookshelf'
+    : (data.shelves.find(s=> String(s.id)===scope) || {}).name
 
   const pct = n=> stats.total ? ` (${Math.round(n/stats.total*100)}%)` : ''
   const monthMax = Math.max(1, ...stats.months.map(m=> m.count))
@@ -2173,13 +2194,24 @@ function StatsPanel({onShow}){
       <div className="card">
         <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
           <h3 style={{margin:0}}>Statistics</h3>
-          <button type="button" onClick={load}>Refresh</button>
+          <div style={{display:'flex', gap:6, alignItems:'center'}}>
+            {data.shelves.length>0 && (
+              <select value={scope} onChange={e=> setScope(e.target.value)} title="Show statistics for one bookshelf"
+                      className="stats-scope">
+                <option value="">All bookshelves</option>
+                {data.shelves.map(s=> <option key={s.id} value={String(s.id)}>{s.name}</option>)}
+                <option value="__unplaced__">Not on a bookshelf</option>
+              </select>
+            )}
+            <button type="button" onClick={load}>Refresh</button>
+          </div>
         </div>
+        {scope && <div className="muted" style={{marginTop:6}}>Statistics for {scopeName} only. Clicking an entry shows the same books in Manage.</div>}
         <div className="stat-tiles">
           <StatTile value={stats.total} label="Books" detail={stats.uniqueTitles!==stats.total ? `${stats.uniqueTitles} unique titles` : null} />
           <StatTile value={stats.authors.length} label="Authors" />
           <StatTile value={stats.series.length} label="Series" />
-          {!readOnly && <StatTile value={stats.placedCount} label="On a bookshelf" detail={pct(stats.placedCount).trim() || null} />}
+          {!readOnly && !scope && <StatTile value={stats.placedCount} label="On a bookshelf" detail={pct(stats.placedCount).trim() || null} />}
           {!readOnly && <StatTile value={stats.loans.length} label="Checked out" />}
           <StatTile value={addedThisYear} label="Added in 12 months" />
         </div>
@@ -2254,7 +2286,7 @@ function StatsPanel({onShow}){
               <AttentionRow label="No cover" books={stats.missingCover} />
               <AttentionRow label="No tags" books={stats.missingTags} />
               <AttentionRow label="No format" books={stats.noFormat} onShow={()=> onShow({format:'__none__'})} />
-              <AttentionRow label="No location" books={stats.missingLocation} onShow={()=> onShow({shelf:'__unplaced__'})} />
+              {!scope && <AttentionRow label="No location" books={stats.missingLocation} onShow={()=> onShow({shelf:'__unplaced__'})} />}
             </ul>
           </div>
         )}

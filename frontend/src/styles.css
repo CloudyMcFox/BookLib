@@ -276,6 +276,7 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 }
 
 /* Statistics */
+.stats-scope{padding:6px 8px;border:1px solid #ccd0d5;border-radius:5px;background:#fff;font-size:14px}
 .stat-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-top:12px}
 .stat-tile{background:#f7f8fa;border:1px solid #e3e6ea;border-radius:8px;padding:10px 12px}
 .stat-value{font-size:24px;font-weight:700;font-variant-numeric:tabular-nums}
