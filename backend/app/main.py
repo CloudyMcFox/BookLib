@@ -875,6 +875,16 @@ GENRE_VOCAB = [
 ]
 
 
+# The canonical genre names, so clients can tell a genre tag such as "Fantasy"
+# from a personal one such as "Signed". Genres are stored as ordinary tags, so
+# this is the only record of which ones they are.
+GENRE_LABELS = {label.lower() for _, label in GENRE_VOCAB} | {'romantasy'}
+
+
+def is_genre_tag(name: str) -> bool:
+    return (name or '').strip().lower() in GENRE_LABELS
+
+
 def _title_segment(text: str) -> str:
     """'FICTION' -> 'Fiction', but leave 'Mystery & Detective' alone."""
     words = []
@@ -2228,11 +2238,13 @@ def shelf_layout(shelf_id: int,
 
 @app.get("/tags")
 def list_tags(current_user: dict = Depends(get_current_user)):
-    """Every tag in use, with how many books carry it — powers the filter list."""
+    """Every tag in use, with how many books carry it — powers the filter list.
+    `genre` marks the tags that are one of the canonical genre names."""
     cur = conn.execute("""SELECT t.name AS name, COUNT(bt.book_id) AS count
                           FROM tags t JOIN book_tags bt ON bt.tag_id = t.id
                           GROUP BY t.id ORDER BY t.name COLLATE NOCASE""")
-    return [{"name": r['name'], "count": r['count']} for r in cur.fetchall()]
+    return [{"name": r['name'], "count": r['count'], "genre": is_genre_tag(r['name'])}
+            for r in cur.fetchall()]
 
 @app.delete("/books/{book_id}")
 def delete_book(book_id: int, current_user: dict = Depends(require_editor)):
