@@ -4,10 +4,11 @@ title: Privacy Policy
 permalink: /privacy/
 ---
 
-**Effective date: September 1, 2026**
+**Effective date: November 14, 2026**
 
-BookLib for iOS is a companion app for a self-hosted BookLib server. This
-policy explains how the app handles information.
+BookLib for iOS and BookLib for Android are companion apps for a self-hosted
+BookLib server. This policy explains how the apps handle information. "The
+app" below means either of them unless a section says otherwise.
 
 ## No centralized BookLib service
 
@@ -37,11 +38,21 @@ ask that person or organization how they handle your information.
 
 The app stores the selected server address and app preferences on your device.
 Authentication tokens and, when you enable **Stay signed in**, your username
-and password are stored in the iOS Keychain. Signing out removes the saved
-BookLib credentials from the device.
+and password are stored securely: in the Keychain on iOS, and on Android
+encrypted with a key held in the Android Keystore. The Android app opts out of
+Android cloud backup, so these are not copied off the device. Signing out
+removes the saved BookLib credentials from the device.
 
 The Apple Watch companion does not store separate server credentials. It asks
 the paired iPhone for library information when needed.
+
+## Guest checkout
+
+When you open a guest checkout link or QR code, the app connects to the BookLib
+server named in that link and gets a temporary guest session from it. Books you
+look up and any borrower name you enter are sent to that server. On Android the
+guest session is kept only in memory and ends when you close guest checkout; it
+never affects the server you are signed in to.
 
 ## Camera access
 
@@ -50,17 +61,27 @@ recognition is performed on the device, and the detected ISBN is sent to your
 configured BookLib server for lookup. BookLib does not record or upload camera
 video.
 
+On Android, barcode recognition uses Google's ML Kit, which runs on the device.
+ML Kit may send Google limited diagnostic information about its own operation,
+such as device model, operating system version, app version and performance
+metrics. It does not send camera images or the barcodes it reads. See
+[ML Kit's data disclosure](https://developers.google.com/ml-kit/android-data-disclosure).
+
 ## External catalogue services
 
 Your BookLib server may use OpenLibrary and, if configured by the server
 operator, Google Books to retrieve public book metadata and cover images. The
-iOS app may also open catalogue pages in your browser when you select an
-external source link. Those services have their own privacy policies.
+app may also open catalogue pages in your browser when you select an
+external source link, and, when you search for a book to add, may load public
+cover images directly from the catalogue's image servers. Those requests
+include your device's IP address but no BookLib information. Those services
+have their own privacy policies.
 
-## Apple services
+## Apple and Google services
 
-iOS and the App Store may process information under Apple's privacy policy.
-BookLib does not receive that information from Apple.
+iOS and the App Store may process information under Apple's privacy policy,
+and Android and Google Play under Google's. BookLib does not receive that
+information from Apple or Google.
 
 ## Children's privacy
 
