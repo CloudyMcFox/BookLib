@@ -1,6 +1,6 @@
 ---
 layout: page
-title: App Clip QR links
+title: Guest checkout QR links
 permalink: /app-clip/
 ---
 
@@ -13,6 +13,10 @@ https://clip.booklib.cloudstarsoftware.com/open?server=https%3A%2F%2Fbooks.examp
 
 The App Clip opens the named server, requests a temporary guest session, scans
 the ISBN barcode on a book, and asks for the borrower's name before checkout.
+
+On Android, the same links open guest checkout inside the BookLib app when it
+is installed. It works the same way and never affects the server the app is
+signed in to.
 
 The server must:
 
