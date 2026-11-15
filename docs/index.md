@@ -1,19 +1,19 @@
 ---
 layout: page
-title: BookLib for iOS
+title: BookLib for iOS and Android
 permalink: /
 ---
 
-BookLib for iOS is a companion app for the
+BookLib for iOS and BookLib for Android are companion apps for the
 [BookLib self-hosted library server](https://github.com/CloudyMcFox/BookLib).
-It lets you browse and manage your personal book collection, scan ISBN
-barcodes, record shelf locations, and manage checkouts from iPhone, iPad, and
-Apple Watch.
+They let you browse and manage your personal book collection, scan ISBN
+barcodes, record shelf locations, and manage checkouts from iPhone, iPad and
+Apple Watch, or from an Android phone or tablet.
 
-The app does not provide or require a centralized BookLib account. You connect
-it directly to a BookLib server that you or your server administrator operates.
+The apps do not provide or require a centralized BookLib account. You connect
+them directly to a BookLib server that you or your server administrator operates.
 
 - [Privacy Policy](privacy/)
 - [Support](support/)
-- [App Clip QR links](app-clip/)
+- [Guest checkout QR links](app-clip/)
 - [BookLib server source and setup](https://github.com/CloudyMcFox/BookLib)

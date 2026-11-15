@@ -4,7 +4,7 @@ title: Support
 permalink: /support/
 ---
 
-BookLib for iOS requires access to a compatible
+BookLib for iOS and BookLib for Android require access to a compatible
 [self-hosted BookLib server](https://github.com/CloudyMcFox/BookLib).
 
 ## Before requesting help
@@ -28,8 +28,8 @@ Search the [existing issues](https://github.com/CloudyMcFox/BookLib/issues)
 before opening a new report. If the problem has not been reported, use the
 [bug report form](https://github.com/CloudyMcFox/BookLib/issues/new/choose).
 
-Include the app version, iOS version, server version, and steps to reproduce the
-problem. Do not post passwords, access tokens, private server addresses,
+Include whether you use iOS or Android, the app version, the iOS or Android
+version, the server version, and steps to reproduce the problem. Do not post passwords, access tokens, private server addresses,
 database files, borrower information, or other personal library data.
 
 Security vulnerabilities must be reported privately through
