@@ -61,6 +61,13 @@ GUEST_TOKEN_EXPIRE_MINUTES = int(os.environ.get("GUEST_TOKEN_EXPIRE_MINUTES", 12
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "").strip()
 GOOGLE_BOOKS_ENABLED = os.environ.get("GOOGLE_BOOKS_ENABLED", "true").strip().lower() not in ("0", "false", "no")
 
+# Hardcover has the best-curated series data of any catalogue, but its API needs
+# a personal access token (hardcover.app → Settings → Hardcover API). Read-only
+# catalogue access is all this app uses. Hardcover's own page shows the token
+# with a "Bearer " prefix, so accept it pasted either way.
+HARDCOVER_API_TOKEN = re.sub(r'^\s*bearer\s+', '', os.environ.get("HARDCOVER_API_TOKEN", ""),
+                             flags=re.IGNORECASE).strip()
+
 # Shelf defaults, used only for the shelf seeded on first start. Shelves are
 # data, so sizes are edited through the API rather than by redeploying.
 DEFAULT_SHELF_COLUMNS = int(os.environ.get("DEFAULT_SHELF_COLUMNS", 6))
@@ -304,6 +311,9 @@ def clean_series(value: Optional[str]) -> Optional[str]:
         return None
     v = re.sub(r'\s+', ' ', v).strip(' ,;:-')
     v = re.sub(r'\s+series$', '', v, flags=re.IGNORECASE).strip(' ,;:-')
+    # Hardcover keeps each reading order as its own series ("The Chronicles of
+    # Narnia (Publication Order)"); the order is not part of the series' name.
+    v = re.sub(r'\s*[\(\[][^()\[\]]*\border\b[^()\[\]]*[\)\]]\s*$', '', v, flags=re.IGNORECASE).strip(' ,;:-')
     # "the Wheel of Time" and "The Wheel of Time" are one series, and which one
     # is stored depends only on where the sentence it was read out of started.
     v = re.sub(r'^the\s+', 'The ', v, flags=re.IGNORECASE)
@@ -339,10 +349,15 @@ def split_series(value: Optional[str]) -> tuple:
     if not v:
         return (None, None)
     v = re.sub(r'\s+', ' ', v)
-    segments = [v] + [s for s in v.split(';') if s.strip()]
+    # Each naming on its own first. The whole string comes last, for the
+    # "The Wheel of Time ; 1" shape where the semicolon parts name from number;
+    # read first, it glued neighbouring namings together, so
+    # "The Kingkiller Chronicle, Day 1; Daw Books Collectors #1396" became one
+    # series at volume 1396.
+    segments = [s for s in v.split(';') if s.strip()] + [v]
     for segment in segments:
         name, index = _series_from_text(segment)
-        if name and index is not None:
+        if name and index is not None and ';' not in name:
             return (name, index)
     # No number anywhere: keep the name, dropping a trailing "(1)" that the
     # patterns above declined only because the name beside it was too short.
@@ -1651,7 +1666,7 @@ def _openlibrary_edition(olid: Optional[str], isbn: Optional[str]) -> Optional[d
            ([f"{OL_BASE}/isbn/{cleaned}.json"] if cleaned else [])
     for url in urls:
         try:
-            r = requests.get(url, timeout=8)
+            r = requests.get(url, headers=CATALOGUE_HEADERS, timeout=8)
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, dict):
@@ -1670,7 +1685,7 @@ def _openlibrary_works(edition: Optional[dict]) -> List[dict]:
         if not key:
             continue
         try:
-            r = requests.get(f"{OL_BASE}{key}.json", timeout=8)
+            r = requests.get(f"{OL_BASE}{key}.json", headers=CATALOGUE_HEADERS, timeout=8)
             if r.status_code == 200 and isinstance(r.json(), dict):
                 works.append(r.json())
         except (requests.RequestException, ValueError):
@@ -1721,7 +1736,9 @@ _SERIES_PAREN_NUMBER = re.compile(r'^\s*(?P<name>.+?)\s*[\(\[]\s*(?P<num>\d+(?:\
 _NOT_A_SERIES = re.compile(
     r'\b(edition|ed\.|reprint|revised|illustrated|unabridged|abridged|anniversary|'
     r'paperback|hardcover|hardback|audio|audiobook|movie tie|deluxe|boxed set|'
-    r'library|translated|complete|collection|omnibus|a novel|novel)\b', re.IGNORECASE)
+    r'library|translated|complete|collection|omnibus|a novel|novel|'
+    # Publisher catalogue numbers: "Daw Books Collectors #1396".
+    r'collectors?|imprint|publishing)\b', re.IGNORECASE)
 
 
 def _series_number(raw: Optional[str]) -> Optional[float]:
@@ -1778,42 +1795,294 @@ def _series_from_title(*titles) -> tuple:
     return (None, None)
 
 
-def _fetch_series(olid: Optional[str], isbn: Optional[str], title: Optional[str] = None,
-                  google_id: Optional[str] = None) -> tuple:
-    """Find the series a book belongs to, as (name, index).
+HARDCOVER_URL = "https://api.hardcover.app/v1/graphql"
+WIKIDATA_SPARQL_URL = "https://query.wikidata.org/sparql"
+# Wikidata refuses clients without a descriptive User-Agent, and OpenLibrary
+# and Hardcover both ask for one.
+CATALOGUE_HEADERS = {"User-Agent": "booklib/1.0 (self-hosted home library catalogue)"}
 
-    There is no reliable structured field for this on either catalogue.
-    OpenLibrary's edition records have a `series` field, which is the one place
-    it is stated outright, but it is filled in for a minority of editions;
-    Google Books publishes only an order number, never the series name. What
-    both do carry is the full title as printed, and publishers put the series in
-    the subtitle ("Book Three of the Stormlight Archive") or in a parenthetical
-    ("Words of Radiance (The Stormlight Archive, #2)"). So: the explicit field
-    first, then the titles and subtitles of the edition, its work, and Google's
-    record of it, and the stored title last."""
-    edition = _openlibrary_edition(olid, isbn)
-    for raw in ((edition or {}).get('series') or []):
-        name, index = split_series(raw if isinstance(raw, str) else None)
+# Only the series a book is part of. Compilations ("Books 1-3") are left out
+# so a box set cannot claim the first volume's place in the reading order.
+_HARDCOVER_SERIES_SELECTION = """
+    title
+    contributions(limit: 3) { author { name } }
+    book_series(where: {compilation: {_eq: false}}, order_by: {featured: desc}, limit: 3) {
+      position
+      series { name }
+    }
+"""
+_HARDCOVER_BY_ISBN = """
+query SeriesByIsbn($isbns: [String!]) {
+  editions(where: {_or: [{isbn_13: {_in: $isbns}}, {isbn_10: {_in: $isbns}}]}, limit: 5) {
+    book { %s }
+  }
+}""" % _HARDCOVER_SERIES_SELECTION
+_HARDCOVER_SEARCH = """
+query SeriesSearch($q: String!) {
+  search(query: $q, query_type: "Book", per_page: 5) { results }
+}"""
+
+
+def _series_key(name: Optional[str]) -> str:
+    """A series name reduced for comparison: "The Wheel of Time series" and
+    "Wheel of Time" are the same series."""
+    v = re.sub(r'^\s*the\s+', '', name or '', flags=re.IGNORECASE)
+    v = re.sub(r'\s+(series|saga|sequence|cycle)\s*$', '', v, flags=re.IGNORECASE)
+    return _normalized(v)
+
+
+def _same_series(a: Optional[str], b: Optional[str]) -> bool:
+    """Whether two catalogues name the same series. Containment rather than
+    equality, so "Dune" matches "Dune Chronicles"."""
+    ka, kb = _series_key(a), _series_key(b)
+    return bool(ka and kb and (ka in kb or kb in ka))
+
+
+def _same_book(found_title: Optional[str], found_authors: List[str],
+               title: Optional[str], author: Optional[str]) -> bool:
+    """Whether a search hit is the book we asked about. Titles match on either
+    being a prefix of the other, since editions differ by subtitle; the author
+    must share a surname-length token when we know it, so a namesake by
+    someone else cannot donate its series."""
+    wanted, found = _normalized(title), _normalized(found_title)
+    if not wanted or not found or not (found.startswith(wanted) or wanted.startswith(found)):
+        return False
+    if not author:
+        return True
+    tokens = {t for t in re.findall(r'[a-z]+', author.lower()) if len(t) > 2}
+    found_tokens = {t for a in found_authors for t in re.findall(r'[a-z]+', (a or '').lower())}
+    return bool(tokens & found_tokens)
+
+
+def _first_author(author: Optional[str]) -> Optional[str]:
+    """The books table stores several authors as one comma-joined string;
+    catalogues match a single name far better."""
+    a = clean(author)
+    return a.split(',')[0].strip() if a else None
+
+
+def _hardcover_query(query: str, variables: dict, notes: Optional[dict] = None) -> Optional[dict]:
+    """Run one GraphQL query against Hardcover; None on any failure. Each query
+    here has a single top-level field, so it costs one request of the daily
+    allowance."""
+    if not HARDCOVER_API_TOKEN:
+        return None
+    try:
+        r = requests.post(HARDCOVER_URL, json={'query': query, 'variables': variables},
+                          headers={**CATALOGUE_HEADERS, 'Authorization': f'Bearer {HARDCOVER_API_TOKEN}'},
+                          timeout=8)
+        if notes is not None:
+            notes['hardcover_http_status'] = r.status_code
+        if r.status_code != 200:
+            if notes is not None:
+                notes['hardcover_error'] = r.text[:300]
+            return None
+        body = r.json()
+    except (requests.RequestException, ValueError) as exc:
+        if notes is not None:
+            notes['hardcover_error'] = type(exc).__name__
+        return None
+    if body.get('errors'):
+        if notes is not None:
+            notes['hardcover_error'] = str(body['errors'])[:300]
+        return None
+    return body.get('data') if isinstance(body.get('data'), dict) else None
+
+
+def _hardcover_book_series(book: dict) -> tuple:
+    for entry in (book.get('book_series') or []):
+        name = clean_series(((entry or {}).get('series') or {}).get('name'))
         if name:
-            # An edition that names the series but not the volume can still take
-            # its number from the title.
-            if index is None:
-                index = _series_from_title(edition.get('title'), title)[1]
-            return (catalogue_title_case(name), index)
+            return (name, clean_series_index(entry.get('position')))
+    return (None, None)
 
-    # OpenLibrary titles and subtitles, then Google's, then ours.
-    candidates: List[Optional[str]] = []
+
+def _hardcover_series(isbn: Optional[str], title: Optional[str], author: Optional[str],
+                      notes: Optional[dict] = None) -> tuple:
+    """The series Hardcover's librarians record for a book.
+
+    By ISBN when there is one. A book Hardcover holds under that ISBN with no
+    series is taken as a standalone: falling through to a title search could
+    only find some other book's series. The title search is for books with no
+    usable ISBN."""
+    usable = duplicate_isbn(isbn)
+    isbns = sorted(isbn_equivalents(usable)) if usable else []
+    if not isbns and usable:
+        isbns = [re.sub(r'[^0-9Xx]', '', usable)]
+    if isbns:
+        data = _hardcover_query(_HARDCOVER_BY_ISBN, {'isbns': isbns}, notes)
+        editions = (data or {}).get('editions') or []
+        for edition in editions:
+            found = _hardcover_book_series((edition or {}).get('book') or {})
+            if found[0]:
+                return found
+        if editions:
+            return (None, None)
+
+    if not clean(title):
+        return (None, None)
+    query = ' '.join(p for p in (clean(title), _first_author(author)) if p)
+    data = _hardcover_query(_HARDCOVER_SEARCH, {'q': query}, notes)
+    results = ((data or {}).get('search') or {}).get('results') or {}
+    for hit in (results.get('hits') or [] if isinstance(results, dict) else []):
+        doc = (hit or {}).get('document') or {}
+        if not _same_book(doc.get('title'), doc.get('author_names') or [], title, _first_author(author)):
+            continue
+        featured = doc.get('featured_series') or {}
+        name = clean_series((featured.get('series') or {}).get('name') or featured.get('name')) \
+            if isinstance(featured, dict) else None
+        if not name:
+            names = doc.get('series_names') or []
+            name = clean_series(names[0]) if names else None
+        if name:
+            position = featured.get('position') if isinstance(featured, dict) else None
+            if position is None:
+                position = doc.get('featured_series_position')
+            return (name, clean_series_index(position))
+        # The book itself was found and has no series.
+        return (None, None)
+    return (None, None)
+
+
+def _openlibrary_search_works(title: Optional[str], author: Optional[str]) -> List[dict]:
+    """The OpenLibrary work for a book we know only by title and author."""
+    if not clean(title):
+        return []
+    params = {'title': clean(title), 'limit': 5, 'fields': 'key,title,author_name'}
+    if _first_author(author):
+        params['author'] = _first_author(author)
+    try:
+        r = requests.get(f"{OL_BASE}/search.json", params=params, headers=CATALOGUE_HEADERS, timeout=10)
+        docs = r.json().get('docs') or [] if r.status_code == 200 else []
+    except (requests.RequestException, ValueError):
+        return []
+    for doc in docs:
+        key = doc.get('key') or ''
+        if re.fullmatch(r'/works/OL\d+W', key) and _same_book(
+                doc.get('title'), doc.get('author_name') or [], title, _first_author(author)):
+            return _openlibrary_works({'works': [{'key': key}]})
+    return []
+
+
+def _openlibrary_work_series(works: List[dict]) -> tuple:
+    """OpenLibrary's structured series, kept on the work record as
+    [{"series": {"key": "/series/OL326110L"}, "position": "1"}]. The name lives
+    on the series record, which is one more request."""
+    for work in works:
+        for entry in (work.get('series') or []):
+            if not isinstance(entry, dict):
+                continue
+            ref = entry.get('series')
+            key = ref.get('key') if isinstance(ref, dict) else None
+            if not key or not re.fullmatch(r'/series/OL\d+L', key):
+                continue
+            try:
+                r = requests.get(f"{OL_BASE}{key}.json", headers=CATALOGUE_HEADERS, timeout=8)
+                record = r.json() if r.status_code == 200 else {}
+            except (requests.RequestException, ValueError):
+                continue
+            name = clean_series(record.get('name') if isinstance(record, dict) else None)
+            if name:
+                return (name, clean_series_index(entry.get('position')))
+    return (None, None)
+
+
+def _wikidata_series(works: List[dict]) -> tuple:
+    """Wikidata's "part of the series" (P179) and its "series ordinal"
+    qualifier, joined through the OpenLibrary work id (P648) so there is no
+    title matching to get wrong. A book in nested series (the Cosmere and the
+    Stormlight Archive) is usually numbered only in the narrower one, so a
+    numbered statement wins."""
+    ids = [w.get('key', '').rsplit('/', 1)[-1] for w in works]
+    ids = [i for i in ids if re.fullmatch(r'OL\d+W', i)]
+    if not ids:
+        return (None, None)
+    values = ' '.join(f'"{i}"' for i in ids)
+    query = f"""SELECT ?name ?ordinal WHERE {{
+      VALUES ?olid {{ {values} }}
+      ?book wdt:P648 ?olid; p:P179 ?statement.
+      ?statement ps:P179 ?series.
+      MINUS {{ ?statement wikibase:rank wikibase:DeprecatedRank }}
+      OPTIONAL {{ ?statement pq:P1545 ?ordinal }}
+      ?series rdfs:label ?name FILTER(LANG(?name) = "en")
+    }} LIMIT 10"""
+    try:
+        r = requests.get(WIKIDATA_SPARQL_URL, params={'query': query, 'format': 'json'},
+                         headers=CATALOGUE_HEADERS, timeout=10)
+        rows = r.json()['results']['bindings'] if r.status_code == 200 else []
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        return (None, None)
+    found = [(clean_series(row.get('name', {}).get('value')),
+              clean_series_index(row.get('ordinal', {}).get('value'))) for row in rows]
+    found = [f for f in found if f[0]]
+    numbered = [f for f in found if f[1] is not None]
+    return (numbered or found or [(None, None)])[0]
+
+
+def _series_sources(olid: Optional[str], isbn: Optional[str], title: Optional[str],
+                    author: Optional[str], notes: Optional[dict] = None):
+    """Every catalogue's answer, as (source, name, index), best source first.
+
+    A generator, so a lookup that is answered early never makes the later
+    requests. Structured data comes first: Hardcover's librarian-curated
+    series, then OpenLibrary's work-level series, then Wikidata. The edition's
+    free-text `series` field and the series publishers print in titles
+    ("Words of Radiance (The Stormlight Archive, #2)") are the fallbacks.
+    Google Books is not asked: its titles rarely carry the series, and its
+    structured series data is empty for print editions."""
+    if HARDCOVER_API_TOKEN:
+        yield ('hardcover',) + _hardcover_series(isbn, title, author, notes)
+
+    edition = _openlibrary_edition(olid, isbn)
+    works = _openlibrary_works(edition)
+    if not works:
+        works = _openlibrary_search_works(title, author)
+    if notes is not None:
+        notes['openlibrary_edition'] = (edition or {}).get('key')
+        notes['openlibrary_works'] = [w.get('key') for w in works]
+
+    yield ('openlibrary_work',) + _openlibrary_work_series(works)
+    yield ('wikidata',) + _wikidata_series(works)
+
+    edition_series = (None, None)
+    for raw in ((edition or {}).get('series') or []):
+        edition_series = split_series(raw if isinstance(raw, str) else None)
+        if edition_series[0]:
+            break
+    yield ('openlibrary_edition',) + edition_series
+
+    titles: List[Optional[str]] = []
     if edition:
-        candidates.extend([edition.get('title'), edition.get('subtitle')])
-    for work in _openlibrary_works(edition):
-        candidates.extend([work.get('title'), work.get('subtitle')])
+        titles.extend([edition.get('title'), edition.get('subtitle')])
+    for work in works:
+        titles.extend([work.get('title'), work.get('subtitle')])
+    titles.append(title)
+    yield ('title',) + _series_from_title(*titles)
 
-    info = (_google_item_for(isbn, google_id) or {}).get('volumeInfo') or {}
-    candidates.extend([info.get('title'), info.get('subtitle')])
-    candidates.append(title)
 
-    name, index = _series_from_title(*candidates)
-    return (catalogue_title_case(name), index)
+def _pick_series(candidates) -> tuple:
+    """The first series named, numbered from the first later source that
+    agrees on the name when the first gave no number. Stops consuming as soon
+    as it has both, so later sources are never fetched."""
+    chosen = None
+    for _source, name, index in candidates:
+        if not name:
+            continue
+        if chosen is None:
+            chosen = [name, index]
+        elif index is not None and _same_series(chosen[0], name):
+            chosen[1] = index
+        if chosen[1] is not None:
+            break
+    if not chosen:
+        return (None, None)
+    return (catalogue_title_case(chosen[0]), chosen[1])
+
+
+def _fetch_series(olid: Optional[str], isbn: Optional[str], title: Optional[str] = None,
+                  author: Optional[str] = None) -> tuple:
+    """Find the series a book belongs to, as (name, index)."""
+    return _pick_series(_series_sources(olid, isbn, title, author))
 
 
 def _fetch_description(olid: Optional[str], isbn: Optional[str], title: Optional[str] = None,
@@ -1920,7 +2189,7 @@ def _enrich_new_book(book_id: int, title: str, author: Optional[str],
     db = get_conn()
     try:
         if needs_series:
-            series, series_index = _fetch_series(olid, isbn, title, google_id)
+            series, series_index = _fetch_series(olid, isbn, title, author)
             if series:
                 db.execute("UPDATE books SET series=?, series_index=? WHERE id=?",
                            (series, series_index, book_id))
@@ -2549,20 +2818,21 @@ def lookup_book_format(book_id: int, current_user: dict = Depends(require_editor
 def lookup_book_series(book_id: int, current_user: dict = Depends(require_editor)):
     """Fetch the series and volume number for one book.
 
-    OpenLibrary states the series outright on its edition records; where it does
-    not, the series is read out of the parenthesised suffix publishers put on
-    the title. Either way this only ever writes what a catalogue says, so a
-    series typed by hand is replaced only when a lookup actually finds one."""
-    cur = conn.execute("SELECT id, isbn, olid, google_id, title FROM books WHERE id=?", (book_id,))
+    Asks Hardcover (when a token is set), OpenLibrary's work records and
+    Wikidata, then falls back to the series publishers print in the title; see
+    _series_sources. This only ever writes what a catalogue says, so a series
+    typed by hand is replaced only when a lookup actually finds one."""
+    cur = conn.execute("SELECT id, isbn, olid, title, author FROM books WHERE id=?", (book_id,))
     row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
     if not clean(row['isbn']) and not clean_olid(row['olid']) and not clean(row['title']):
         raise HTTPException(status_code=400, detail="This book needs an ISBN, OLID or title to look up its series")
 
-    name, index = _fetch_series(row['olid'], row['isbn'], row['title'], row['google_id'])
+    name, index = _fetch_series(row['olid'], row['isbn'], row['title'], row['author'])
     if not name:
-        raise HTTPException(status_code=404, detail="No series found for this book on OpenLibrary or Google Books")
+        sources = "Hardcover, OpenLibrary or Wikidata" if HARDCOVER_API_TOKEN else "OpenLibrary or Wikidata"
+        raise HTTPException(status_code=404, detail=f"No series found for this book on {sources}")
 
     conn.execute("UPDATE books SET series=?, series_index=? WHERE id=?", (name, index, book_id))
     conn.commit()
@@ -3150,6 +3420,28 @@ def lookup_isbn(isbn: str, current_user: dict = Depends(get_current_user)):
         "olid": _lookup_olid_by_isbn(isbn),
         "google_id": google_item.get("id"),
         "source": "google",
+    }
+
+
+@app.get("/diagnostics/series")
+def diagnose_series(isbn: Optional[str] = None, olid: Optional[str] = None,
+                    title: Optional[str] = None, author: Optional[str] = None,
+                    current_user: dict = Depends(require_editor)):
+    """Ask every series source and show what each one said, rather than
+    stopping at the first answer as a real lookup does. Separates "no catalogue
+    knows this series" from "a source is failing" (a bad Hardcover token shows
+    up as hardcover_http_status 401).
+
+    Declared before /diagnostics/{isbn} so the literal path wins the match."""
+    if not clean(isbn) and not clean_olid(olid) and not clean(title):
+        raise HTTPException(status_code=400, detail="Pass an isbn, olid or title")
+    notes: dict = {"hardcover_token_set": bool(HARDCOVER_API_TOKEN)}
+    sources = list(_series_sources(olid, isbn, title, author, notes))
+    name, index = _pick_series(sources)
+    return {
+        **notes,
+        "sources": [{"source": s, "series": n, "index": i} for s, n, i in sources],
+        "result": {"series": name, "index": index},
     }
 
 
