@@ -13,8 +13,9 @@ anywhere Docker does — it was built to live on a Synology NAS.
 - Sort the library by title, author, series, date added or shelf location.
 - Record where each book physically lives, on shelves you define yourself.
 - Tags: genres extracted from OpenLibrary, editable inline, with a tag filter.
-- Series: the series and volume number, read out of OpenLibrary's series field
-  or the published title, kept as separate fields so a series sorts in reading
+- Series: the series and volume number, from [Hardcover](https://hardcover.app)
+  (optional), OpenLibrary and [Wikidata](https://www.wikidata.org), or failing
+  those the published title, kept as separate fields so a series sorts in reading
   order and shown as "The Stormlight Archive (3)". Click a series in the
   library table to show every book in it.
 - Descriptions from Google Books or OpenLibrary, collapsed to a one-line preview
@@ -113,6 +114,7 @@ All settings live in `.env` (never committed — see `.env.example`).
 | `GUEST_TOKEN_EXPIRE_MINUTES` | Guest session lifetime (default `120`)             |
 | `GOOGLE_BOOKS_API_KEY` | Optional key for the Google Books fallback (recommended) |
 | `GOOGLE_BOOKS_ENABLED` | Set to `false` to disable the Google Books fallback |
+| `HARDCOVER_API_TOKEN` | Optional Hardcover token for the best series data (see [Series lookup](#series-lookup)) |
 | `DEFAULT_SHELF_COLUMNS` / `DEFAULT_SHELF_ROWS` | Size of the shelf seeded on a new database (default `6` / `8`) |
 | `BACKEND_PORT`   | Loopback-only host port for API diagnostics (default `8882`)    |
 | `FRONTEND_PORT`  | Loopback-only host port for the UI (default `3006`)             |
@@ -260,6 +262,7 @@ or check books in. Guests may use the checkout route.
 | `GET`    | `/edition/{olid}` | OpenLibrary edition detail by OLID       |
 | `GET`    | `/diagnostics/{isbn}` | What each catalogue holds for an ISBN |
 | `GET`    | `/diagnostics/search` | The Google queries a search would run |
+| `GET`    | `/diagnostics/series` | What every series source says for an `isbn`/`olid`/`title`/`author` |
 
 `/search` returns English editions by default; pass
 `include_all_languages=true` to include translations.
@@ -474,6 +477,39 @@ The diagnostics endpoints clear the lookup cache before running, so they always
 report live data.
 
 Interactive docs are at `http://localhost:8882/docs`.
+
+## Series lookup
+
+No single catalogue knows every series, so the lookup asks several in order and
+stops at the first that names one:
+
+1. **Hardcover**, if `HARDCOVER_API_TOKEN` is set. Its series data is curated by
+   librarians and is the most complete. Looked up by ISBN; books without one are
+   matched by title and author.
+2. **OpenLibrary's work record**, which carries a structured series and position
+   for a growing share of books.
+3. **Wikidata**'s *part of the series* and *series ordinal*, joined through the
+   OpenLibrary work id rather than by title.
+4. OpenLibrary's free-text edition `series` field, then the series publishers
+   print in the title ("Words of Radiance (The Stormlight Archive, #2)").
+
+When the first source names a series but not the volume number, the number is
+taken from a later source that agrees on the series name. Google Books is not
+asked: its titles rarely carry the series and its structured series data is
+empty for print editions.
+
+To enable Hardcover, sign in at [hardcover.app](https://hardcover.app), open
+**Settings → Hardcover API**, create a key with only the `read:catalog` scope, and
+put it in `.env` as `HARDCOVER_API_TOKEN` (with or without the `Bearer ` prefix).
+The free plan allows 5,000 requests a day, and each lookup uses one. Tokens
+expire on the date you choose when creating them.
+
+`GET /diagnostics/series?isbn=…` asks every source and shows each answer, plus
+`hardcover_http_status` — a `401` there means the token is wrong or expired:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN"   "http://127.0.0.1:8882/diagnostics/series?isbn=9780439023481&title=The%20Hunger%20Games&author=Suzanne%20Collins"
+```
 
 ## Local development
 

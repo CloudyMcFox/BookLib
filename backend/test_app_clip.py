@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault(
     "SECRET_KEY",
@@ -285,6 +286,76 @@ class AppClipCheckoutTests(unittest.TestCase):
             self.assertEqual(main.require_shelf_reader(guest), guest)
         finally:
             main.GUEST_SHELF_ACCESS_ENABLED = original
+
+
+class SeriesLookupTests(unittest.TestCase):
+    """Offline: catalogue calls are replaced, so these test the choosing and
+    parsing, not the catalogues."""
+
+    def test_split_series_does_not_glue_namings_together(self):
+        name, index = main.split_series(
+            "The Kingkiller Chronicle, Day 1; Daw Books Collectors #1396")
+        self.assertNotEqual(index, 1396)
+        self.assertNotIn("Daw", name)
+        self.assertEqual(main.split_series("The Wheel of Time ; 1"), ("The Wheel of Time", 1))
+        self.assertEqual(main.split_series("Dune (1); Dune Chronicles"), ("Dune", 1))
+
+    def test_reading_order_is_not_part_of_the_series_name(self):
+        self.assertEqual(main.clean_series("The Chronicles of Narnia (Publication Order)"),
+                         "The Chronicles of Narnia")
+        self.assertEqual(main.clean_series("The Chronicles of Narnia (Chronological Order)"),
+                         "The Chronicles of Narnia")
+        self.assertEqual(main.clean_series("The Order of the Phoenix"), "The Order of the Phoenix")
+
+    def test_first_series_wins_and_takes_number_from_an_agreeing_source(self):
+        picked = main._pick_series([
+            ("hardcover", None, None),
+            ("openlibrary_work", "The Wheel of Time", None),
+            ("wikidata", "Cosmere", 4),
+            ("openlibrary_edition", "Wheel of Time series", 1),
+        ])
+        self.assertEqual(picked, ("The Wheel of Time", 1))
+
+    def test_pick_series_stops_before_later_sources_are_fetched(self):
+        def sources():
+            yield ("hardcover", "Dune", 2)
+            raise AssertionError("later sources must not be asked")
+        self.assertEqual(main._pick_series(sources()), ("Dune", 2))
+
+    def test_hardcover_isbn_match_prefers_series_and_trusts_standalones(self):
+        responses = [{"editions": [{"book": {"title": "Catching Fire", "book_series": [
+            {"position": 2, "series": {"name": "The Hunger Games"}}]}}]}]
+        with mock.patch.object(main, "_hardcover_query", side_effect=lambda *a, **k: responses.pop(0)):
+            self.assertEqual(main._hardcover_series("9780439023498", "Catching Fire", "Suzanne Collins"),
+                             ("The Hunger Games", 2))
+
+        calls = []
+        def standalone(query, variables, notes=None):
+            calls.append(query)
+            return {"editions": [{"book": {"title": "Project Hail Mary", "book_series": []}}]}
+        with mock.patch.object(main, "_hardcover_query", side_effect=standalone):
+            self.assertEqual(main._hardcover_series("9780593135204", "Project Hail Mary", "Andy Weir"),
+                             (None, None))
+        self.assertEqual(len(calls), 1, "a book found by ISBN must not fall through to a title search")
+
+    def test_hardcover_title_search_checks_the_author(self):
+        results = {"search": {"results": {"hits": [
+            {"document": {"title": "Dune", "author_names": ["Someone Else"],
+                          "featured_series": {"position": 9, "series": {"name": "Wrong"}}}},
+            {"document": {"title": "Dune", "author_names": ["Frank Herbert"],
+                          "featured_series": {"position": 1, "series": {"name": "Dune"}}}},
+        ]}}}
+        with mock.patch.object(main, "_hardcover_query", return_value=results):
+            self.assertEqual(main._hardcover_series(None, "Dune", "Frank Herbert"), ("Dune", 1))
+
+    def test_placeholder_isbn_is_never_sent_to_hardcover(self):
+        seen = []
+        def record(query, variables, notes=None):
+            seen.append(variables)
+            return None
+        with mock.patch.object(main, "_hardcover_query", side_effect=record):
+            main._hardcover_series("0000000000", "Some Book", None)
+        self.assertNotIn("isbns", seen[0])
 
 
 if __name__ == "__main__":

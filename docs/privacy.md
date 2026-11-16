@@ -4,7 +4,7 @@ title: Privacy Policy
 permalink: /privacy/
 ---
 
-**Effective date: November 14, 2026**
+**Effective date: November 15, 2026**
 
 BookLib for iOS and BookLib for Android are companion apps for a self-hosted
 BookLib server. This policy explains how the apps handle information. "The
@@ -69,8 +69,10 @@ metrics. It does not send camera images or the barcodes it reads. See
 
 ## External catalogue services
 
-Your BookLib server may use OpenLibrary and, if configured by the server
-operator, Google Books to retrieve public book metadata and cover images. The
+Your BookLib server may use OpenLibrary and Wikidata and, if configured by the
+server operator, Google Books and Hardcover to retrieve public book metadata and
+cover images. These lookups send a book's ISBN, title or author, never
+information about you or your borrowing. The
 app may also open catalogue pages in your browser when you select an
 external source link, and, when you search for a book to add, may load public
 cover images directly from the catalogue's image servers. Those requests
