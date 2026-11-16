@@ -736,7 +736,7 @@ function SeriesCell({book, onChanged, onError, onSeriesClick}){
         : <span className="muted">Standalone</span>}
       {!readOnly && (
         <button type="button" onClick={lookup} disabled={busy}
-                title="Fetch the series from OpenLibrary, falling back to the published title on Google Books">
+                title="Fetch the series from Hardcover, OpenLibrary or Wikidata, falling back to the published title">
           {busy ? '...' : (label ? 'Refresh' : 'Lookup')}
         </button>
       )}
