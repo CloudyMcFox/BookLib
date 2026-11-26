@@ -13,7 +13,8 @@
 
 .PARAMETER Destination
     Where the server's booklib folder is reachable from this machine: a UNC path
-    (\\server\share\booklib) or a mapped/mounted drive.
+    (\\server\share\booklib) or a mapped/mounted drive. Defaults to
+    \\nas\docker\booklib.
 
 .PARAMETER Mirror
     Also delete files on the server that no longer exist here. Excluded files are
@@ -23,7 +24,8 @@
     List what would be copied and deleted, without writing anything.
 
 .EXAMPLE
-    .\deploy.ps1 -Destination \\bookserver\srv\booklib -DryRun
+    .\deploy.ps1 -DryRun
+    .\deploy.ps1
     .\deploy.ps1 -Destination \\bookserver\srv\booklib
 
     Then on the server:
@@ -31,8 +33,7 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Destination,
+    [string]$Destination = '\\nas\docker\booklib',
 
     [switch]$Mirror,
 
