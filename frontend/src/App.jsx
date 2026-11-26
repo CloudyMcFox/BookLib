@@ -1152,7 +1152,13 @@ function ShelfLocator({book, shelves, onClose}){
 
         {error && <div className="alert" style={{marginTop:10}}>{error}</div>}
 
-        {!placed ? (
+        {!placed && t(book.other_location) ? (
+          <div className="locator-empty">
+            <div className="locator-empty-icon">⌂</div>
+            <strong>In {t(book.other_location)}</strong>
+            <span>“{book.title}” is kept somewhere other than a shelf.</span>
+          </div>
+        ) : !placed ? (
           <div className="locator-empty">
             <div className="locator-empty-icon">?</div>
             <strong>No location yet</strong>
@@ -1197,9 +1203,14 @@ function ShelfLocator({book, shelves, onClose}){
   )
 }
 
-/// Modal for placing one book: pick a shelf, click a slot or type the numbers.
+/// Modal for placing one book: pick a shelf, click a slot or type the numbers,
+/// or type a place that is not a shelf at all ("Bedroom").
 function ShelfPicker({book, shelves, onClose, onSaved}){
   const firstId = book.shelf_id || (shelves[0] && shelves[0].id) || null
+  const [mode,setMode] = useState(t(book.other_location) ? 'elsewhere' : 'shelf')
+  const [place,setPlace] = useState(book.other_location || '')
+  // Places used on other books, offered so "Bedroom" is not retyped.
+  const [knownPlaces,setKnownPlaces] = useState([])
   const [shelfId,setShelfId] = useState(firstId)
   const [col,setCol] = useState(book.shelf_column || '')
   const [row,setRow] = useState(book.shelf_row || '')
@@ -1221,6 +1232,17 @@ function ShelfPicker({book, shelves, onClose, onSaved}){
     return ()=>{ cancelled = true }
   }, [shelfId])
 
+  useEffect(()=>{
+    let cancelled = false
+    ;(async ()=>{
+      try{
+        const res = await fetch(`${API_BASE}/other-locations`, {headers: authHeaders()})
+        if(res.ok && !cancelled) setKnownPlaces(await res.json())
+      }catch{ /* suggestions only */ }
+    })()
+    return ()=>{ cancelled = true }
+  }, [])
+
   const pick = (c, r)=>{ setCol(c); setRow(r); setError(null) }
 
   // Show what else is already in the chosen slot, so a clash is visible before
@@ -1241,9 +1263,11 @@ function ShelfPicker({book, shelves, onClose, onSaved}){
     setBusy(false)
   }
 
-  const save = ()=> submit((col && row && shelfId)
-    ? {shelf_id: shelfId, shelf_column: Number(col), shelf_row: Number(row)}
-    : {})
+  const save = ()=> submit(mode==='elsewhere'
+    ? (t(place) ? {other_location: t(place)} : {})
+    : (col && row && shelfId)
+      ? {shelf_id: shelfId, shelf_column: Number(col), shelf_row: Number(row)}
+      : {})
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -1251,7 +1275,29 @@ function ShelfPicker({book, shelves, onClose, onSaved}){
         <h3 style={{marginTop:0}}>Where is “{book.title}”?</h3>
         {error && <div className="alert">{error}</div>}
 
-        {shelves.length===0 ? (
+        <div className="location-mode" role="group" aria-label="Where the book is kept">
+          <button type="button" className={mode==='shelf'? 'primary' : ''} aria-pressed={mode==='shelf'}
+                  onClick={()=>{ setMode('shelf'); setError(null) }}>On a shelf</button>
+          <button type="button" className={mode==='elsewhere'? 'primary' : ''} aria-pressed={mode==='elsewhere'}
+                  onClick={()=>{ setMode('elsewhere'); setError(null) }}>Somewhere else</button>
+        </div>
+
+        {mode==='elsewhere' ? (
+          <>
+            <label>Place
+              <input value={place} list="other-location-options" autoFocus maxLength={100}
+                     placeholder="Bedroom, office, nightstand..."
+                     onChange={e=> setPlace(e.target.value)}
+                     onKeyDown={e=>{ if(e.key==='Enter' && t(place)) save() }} />
+              <datalist id="other-location-options">
+                {knownPlaces.map(name=> <option key={name} value={name} />)}
+              </datalist>
+            </label>
+            <div className="muted" style={{fontSize:13,marginTop:6}}>
+              Books kept somewhere else stay off the shelves and out of the "No location" list.
+            </div>
+          </>
+        ) : shelves.length===0 ? (
           <div style={{color:'#666'}}>No shelves yet — add one on the Shelves tab first.</div>
         ) : (
           <>
@@ -1287,10 +1333,12 @@ function ShelfPicker({book, shelves, onClose, onSaved}){
         )}
 
         <div style={{display:'flex',gap:8,marginTop:14,flexWrap:'wrap'}}>
-          <button type="button" className="primary" onClick={save} disabled={busy || !shelves.length}>
+          <button type="button" className="primary" onClick={save}
+                  disabled={busy || (mode==='elsewhere' ? !t(place) : !shelves.length)}>
             {busy? 'Saving...' : 'Save location'}
           </button>
-          {book.shelf_id && <button type="button" onClick={()=> submit({})} disabled={busy}>Remove location</button>}
+          {(book.shelf_id || t(book.other_location)) &&
+            <button type="button" onClick={()=> submit({})} disabled={busy}>Remove location</button>}
           <button type="button" onClick={onClose} style={{marginLeft:'auto'}}>Cancel</button>
         </div>
       </div>
@@ -1615,9 +1663,11 @@ function LocationCell({book, shelves, onPlace, onLocate}){
   const readOnly = useReadOnly()
   const shelf = (shelves || []).find(s=> s.id === book.shelf_id)
   const placed = book.shelf_id && book.shelf_column && book.shelf_row
+  const elsewhere = !placed && t(book.other_location)
   const where = placed
     ? `${shelf? shelf.name : 'Shelf'} — column ${book.shelf_column}, row ${book.shelf_row}`
-    : 'Not placed on a shelf'
+    : elsewhere ? `Kept in ${elsewhere}, not on a shelf` : 'Not placed on a shelf'
+  const elsewhereLabel = <span className="location-shelf">⌂ {elsewhere}</span>
   const locate = (placed && onLocate) ? (
     <button type="button" className="locate-btn" onClick={()=> onLocate(book)}
             title={`Show where “${book.title}” is on the shelf`}>
@@ -1627,12 +1677,13 @@ function LocationCell({book, shelves, onPlace, onLocate}){
   if(readOnly){
     return (
       <div className="location-cell">
-        <span className={placed? 'location-btn placed' : 'location-btn'} title={where}>
+        <span className={placed || elsewhere? 'location-btn placed' : 'location-btn'} title={where}>
           {placed
             ? <>
                 <span className="location-shelf">{shelf? shelf.name : 'Shelf'}</span>
                 <span className="location-coord">{book.shelf_column},{book.shelf_row}</span>
               </>
+            : elsewhere ? elsewhereLabel
             : <span className="location-empty muted">Not placed</span>}
         </span>
         {locate}
@@ -1641,14 +1692,15 @@ function LocationCell({book, shelves, onPlace, onLocate}){
   }
   return (
     <div className="location-cell">
-      <button type="button" className={placed? 'location-btn placed' : 'location-btn'}
+      <button type="button" className={placed || elsewhere? 'location-btn placed' : 'location-btn'}
               onClick={()=> onPlace(book)}
-              title={placed? where : 'Set where this book lives'}>
+              title={placed || elsewhere? where : 'Set where this book lives'}>
         {placed
           ? <>
               <span className="location-shelf">{shelf? shelf.name : 'Shelf'}</span>
               <span className="location-coord">{book.shelf_column},{book.shelf_row}</span>
             </>
+          : elsewhere ? elsewhereLabel
           : <span className="location-empty">Place</span>}
       </button>
       {locate}
@@ -2069,7 +2121,7 @@ function libraryStats(books, tagCounts, shelves){
     genres, tags, months, shelfFill, loans,
     missingCover: byTitle.filter(b=> !b.has_cover),
     missingTags: byTitle.filter(b=> !(b.tags && b.tags.length)),
-    missingLocation: byTitle.filter(b=> !placed(b)),
+    missingLocation: byTitle.filter(b=> !placed(b) && !t(b.other_location)),
   }
 }
 
@@ -2672,13 +2724,13 @@ export default function App(){
     if(!undo) return
     try{
       if(undo.type==='delete'){
-        const res = await fetch(API_BASE + '/books?allow_duplicate=true', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
+        const res = await fetch(API_BASE + '/books?allow_duplicate=true', {method:'POST', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row, other_location: undo.book.other_location})})
         if(res.ok){
           const restored = await res.json()
           if(undo.wasRecent) setRecent(prev=> sortNewestFirst([restored, ...prev]))
         }
       } else if(undo.type==='update'){
-        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row})})
+        const res = await fetch(API_BASE + '/books/' + undo.book.id, {method:'PUT', headers: authHeaders(true), body: JSON.stringify({title: undo.book.title, author: undo.book.author, isbn: undo.book.isbn, olid: undo.book.olid, google_id: undo.book.google_id, notes: undo.book.notes, created_at: undo.book.created_at, tags: undo.book.tags, shelf_id: undo.book.shelf_id, shelf_column: undo.book.shelf_column, shelf_row: undo.book.shelf_row, other_location: undo.book.other_location})})
         if(res.ok){
           const reverted = await res.json()
           setRecent(prev=> prev.map(x=> x.id===reverted.id ? reverted : x))
@@ -2822,7 +2874,7 @@ export default function App(){
                           title="Show books on one shelf">
                     <option value="">Any shelf</option>
                     {shelves.map(s=> <option key={s.id} value={String(s.id)}>{s.name}</option>)}
-                    <option value="__unplaced__">Not placed</option>
+                    <option value="__unplaced__">No location</option>
                   </select>
                 )}
                 <select value={seriesFilter} onChange={e=>changeSeriesFilter(e.target.value)}

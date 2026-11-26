@@ -295,6 +295,21 @@ MAX_SERIES_LENGTH = 120
 MAX_DESCRIPTION_LENGTH = 8000
 
 
+MAX_OTHER_LOCATION_LENGTH = 100
+
+# A book with a typed place counts as placed even though it is on no shelf.
+HAS_OTHER_LOCATION = "(other_location IS NOT NULL AND other_location <> '')"
+
+
+def clean_other_location(value: Optional[str]) -> Optional[str]:
+    """Tidy a typed place such as 'Bedroom': collapse whitespace and cap the
+    length. Empty means no place."""
+    v = clean(value)
+    if not v:
+        return None
+    return re.sub(r'\s+', ' ', v)[:MAX_OTHER_LOCATION_LENGTH].strip()
+
+
 def clean_series(value: Optional[str]) -> Optional[str]:
     """Tidy a series name: collapse whitespace, drop a trailing 'series' or a
     dangling separator, and cap the length so a stray paragraph cannot be parked
@@ -422,6 +437,10 @@ class Book(BaseModel):
     shelf_id: Optional[int] = None
     shelf_column: Optional[int] = None
     shelf_row: Optional[int] = None
+    # Somewhere other than a shelf, typed by hand ("Bedroom", "Lent to Mum").
+    # A book is on a shelf, somewhere else, or unplaced, never two at once, so
+    # setting one clears the other.
+    other_location: Optional[str] = None
     # Omit on PUT to leave a book's tags untouched; send a list to replace them.
     tags: Optional[List[str]] = None
     # ISO-8601 UTC timestamp of when the book was added (NULL for rows created
@@ -469,6 +488,7 @@ def book_for_user(book: Book, current_user: dict) -> Book:
             "shelf_id": None,
             "shelf_column": None,
             "shelf_row": None,
+            "other_location": None,
         })
     return book.copy(update=hidden)
 
@@ -648,6 +668,8 @@ if 'borrower_name' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN borrower_name TEXT")
 if 'checked_out_at' not in _existing_cols:
     conn.execute("ALTER TABLE books ADD COLUMN checked_out_at TEXT")
+if 'other_location' not in _existing_cols:
+    conn.execute("ALTER TABLE books ADD COLUMN other_location TEXT")
 
 # Early versions made ISBN unique. A personal library may own two physical
 # copies of the same edition, so rebuild that old table once without the
@@ -683,12 +705,13 @@ if _unique_isbn:
             series_index REAL,
             description TEXT,
             borrower_name TEXT,
-            checked_out_at TEXT
+            checked_out_at TEXT,
+            other_location TEXT
         )""")
         _book_storage_columns = (
             "id, title, author, isbn, notes, cover, cover_mime, created_at, olid, google_id, "
             "shelf_id, shelf_column, shelf_row, format, series, series_index, description, "
-            "borrower_name, checked_out_at"
+            "borrower_name, checked_out_at, other_location"
         )
         conn.execute(
             f"INSERT INTO books_without_unique_isbn ({_book_storage_columns}) "
@@ -711,7 +734,7 @@ conn.commit()
 
 # Never SELECT * from books: the cover BLOB would be loaded for every row.
 BOOK_COLUMNS = ("id, title, author, isbn, olid, google_id, notes, format, series, series_index, "
-                "description, created_at, shelf_id, shelf_column, shelf_row, borrower_name, checked_out_at, "
+                "description, created_at, shelf_id, shelf_column, shelf_row, other_location, borrower_name, checked_out_at, "
                 """CASE WHEN isbn IS NULL OR TRIM(isbn)='' OR
                               REPLACE(REPLACE(isbn, '-', ''), ' ', '')='0000000000' THEN 1 ELSE
                    (SELECT COUNT(*) FROM books AS copies
@@ -726,9 +749,10 @@ SORT_CLAUSES = {
     'title': "title COLLATE NOCASE {dir}, id {dir}",
     'author': "CASE WHEN author IS NULL OR author='' THEN 1 ELSE 0 END, author COLLATE NOCASE {dir}, id {dir}",
     'added': "COALESCE(created_at,'') {dir}, id {dir}",
-    # Unplaced books sort last either way, so the list does not open on a block
-    # of blanks.
-    'location': "CASE WHEN shelf_id IS NULL THEN 1 ELSE 0 END, shelf_id {dir}, shelf_row {dir}, shelf_column {dir}, id {dir}",
+    # Shelved books first, then books somewhere else by place, and unplaced
+    # books last either way, so the list does not open on a block of blanks.
+    'location': ("CASE WHEN shelf_id IS NOT NULL THEN 0 WHEN " + HAS_OTHER_LOCATION + " THEN 1 ELSE 2 END, "
+                 "shelf_id {dir}, shelf_row {dir}, shelf_column {dir}, other_location COLLATE NOCASE {dir}, id {dir}"),
     # Within a series, reading order beats alphabetical: the number sorts as a
     # number, and books with no series go last either way.
     'series': ("CASE WHEN series IS NULL OR series='' THEN 1 ELSE 0 END, series COLLATE NOCASE {dir}, "
@@ -831,6 +855,30 @@ def resolve_location(shelf_id: Optional[int], column: Optional[int], row: Option
         raise HTTPException(status_code=400,
                             detail=f"Row must be between 1 and {shelf['rows']} on “{shelf['name']}”")
     return shelf_id, column, row
+
+
+BOTH_LOCATIONS_DETAIL = "A book can be on a shelf or somewhere else, not both"
+
+
+def store_location(book_id: int, shelf_location, other: Optional[str], other_sent: bool):
+    """Write a book's location without committing.
+
+    shelf_location is a resolved (shelf_id, column, row) triple, or None when
+    the caller did not send one. A shelf slot and a typed place are exclusive,
+    so whichever is set clears the other."""
+    on_shelf = shelf_location is not None and shelf_location[0] is not None
+    if on_shelf and other:
+        raise HTTPException(status_code=400, detail=BOTH_LOCATIONS_DETAIL)
+    if shelf_location is not None:
+        conn.execute("UPDATE books SET shelf_id=?, shelf_column=?, shelf_row=? WHERE id=?",
+                     (*shelf_location, book_id))
+    if on_shelf:
+        conn.execute("UPDATE books SET other_location=NULL WHERE id=?", (book_id,))
+    elif other_sent:
+        conn.execute("UPDATE books SET other_location=? WHERE id=?", (other, book_id))
+        if other:
+            conn.execute("UPDATE books SET shelf_id=NULL, shelf_column=NULL, shelf_row=NULL WHERE id=?",
+                         (book_id,))
 
 
 # --- tag helpers ---
@@ -2034,7 +2082,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     ?sort=title|author|added|location|series, ?dir=asc|desc,
     ?tags=a,b with ?match=any|all (default any), ?exclude_tags=a,b to omit
     books having any listed tag, ?shelf_id= to limit to one shelf,
-    ?placed=false to find books with no location yet, ?format= to limit to one
+    ?placed=false to find books with no location yet (neither a shelf slot nor
+    a typed place), ?format= to limit to one
     binding, ?has_format=false to find the books still missing one, ?series= to
     limit to one series, ?has_series=false for the standalones, and
     ?checked_out=true|false to filter by circulation status. ?duplicates_only=true
@@ -2047,6 +2096,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
         searchable = ["title", "author", "isbn", "olid", "series"]
         if not is_guest(current_user):
             searchable.append("notes")
+        if not is_guest(current_user) or GUEST_SHELF_ACCESS_ENABLED:
+            searchable.append("other_location")
         where.append("(" + " OR ".join(f"{column} LIKE ?" for column in searchable) + ")")
         params.extend([pattern] * len(searchable))
 
@@ -2059,7 +2110,8 @@ def list_books(q: Optional[str] = None, sort: Optional[str] = None, dir: Optiona
     if placed is not None:
         if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
             raise HTTPException(status_code=403, detail="Shelf locations are private")
-        where.append("shelf_id IS NOT NULL" if placed else "shelf_id IS NULL")
+        where.append(f"(shelf_id IS NOT NULL OR {HAS_OTHER_LOCATION})" if placed
+                     else f"(shelf_id IS NULL AND NOT {HAS_OTHER_LOCATION})")
 
     # Compared through clean_format so asking for "pbk." finds the Paperbacks,
     # and NOCASE so a value typed by hand still matches the picker.
@@ -2265,10 +2317,10 @@ def duplicate_book(book_id: int, current_user: dict = Depends(require_editor)):
         """INSERT INTO books
            (title, author, isbn, olid, google_id, notes, format, series,
             series_index, description, cover, cover_mime, created_at,
-            shelf_id, shelf_column, shelf_row)
+            shelf_id, shelf_column, shelf_row, other_location)
            SELECT title, author, isbn, olid, google_id, notes, format, series,
                   series_index, description, cover, cover_mime, ?,
-                  shelf_id, shelf_column, shelf_row
+                  shelf_id, shelf_column, shelf_row, other_location
            FROM books WHERE id=?""",
         (now_iso(), book_id),
     )
@@ -2299,6 +2351,14 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(require_edit
     # clear. Pydantic v2 exposes this as model_fields_set.
     sent = getattr(b, 'model_fields_set', None) or getattr(b, '__fields_set__', set())
     location_sent = bool({'shelf_id', 'shelf_column', 'shelf_row'} & set(sent))
+    # Older clients never send other_location, so it is only touched when sent,
+    # or cleared when the book is put on a shelf. Both are checked before any
+    # write so a rejected location leaves no half-applied edit behind.
+    other_sent = 'other_location' in sent
+    shelf_location = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row) if location_sent else None
+    other_location = clean_other_location(b.other_location) if other_sent else None
+    if shelf_location and shelf_location[0] is not None and other_location:
+        raise HTTPException(status_code=400, detail=BOTH_LOCATIONS_DETAIL)
     try:
         conn.execute("UPDATE books SET title=?, author=?, isbn=?, olid=?, google_id=?, notes=? WHERE id=?",
                      (title, clean(b.author), clean(b.isbn), clean_olid(b.olid), clean_google_id(b.google_id),
@@ -2321,10 +2381,8 @@ def update_book(book_id: int, b: Book, current_user: dict = Depends(require_edit
                          (name, index if name else None, book_id))
         if 'description' in sent:
             conn.execute("UPDATE books SET description=? WHERE id=?", (clean_description(b.description), book_id))
-        if location_sent:
-            location = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
-            conn.execute("UPDATE books SET shelf_id=?, shelf_column=?, shelf_row=? WHERE id=?",
-                         (location[0], location[1], location[2], book_id))
+        if location_sent or other_sent:
+            store_location(book_id, shelf_location, other_location, other_sent)
         if added:
             conn.execute("UPDATE books SET created_at=? WHERE id=?", (added, book_id))
         conn.commit()
@@ -2376,11 +2434,14 @@ def add_book(b: Book, background_tasks: BackgroundTasks,
     # Allow an explicit added date (e.g. when restoring a deleted book via undo).
     b.created_at = clean_timestamp(b.created_at) or now_iso()
     b.shelf_id, b.shelf_column, b.shelf_row = resolve_location(b.shelf_id, b.shelf_column, b.shelf_row)
+    b.other_location = clean_other_location(b.other_location)
+    if b.shelf_id is not None and b.other_location:
+        raise HTTPException(status_code=400, detail=BOTH_LOCATIONS_DETAIL)
     try:
-        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, format, series, series_index, description, created_at, shelf_id, shelf_column, shelf_row) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        cur = conn.execute("INSERT INTO books (title, author, isbn, olid, google_id, notes, format, series, series_index, description, created_at, shelf_id, shelf_column, shelf_row, other_location) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                            (b.title, b.author, b.isbn, b.olid, b.google_id, b.notes, b.format,
                             b.series, b.series_index, b.description, b.created_at,
-                            b.shelf_id, b.shelf_column, b.shelf_row))
+                            b.shelf_id, b.shelf_column, b.shelf_row, b.other_location))
         conn.commit()
         b.id = cur.lastrowid
     except sqlite3.IntegrityError as e:
@@ -2661,10 +2722,12 @@ def delete_book_cover(book_id: int, current_user: dict = Depends(require_editor)
     return book_from_row(row)
 
 class BookLocation(BaseModel):
-    """Body for setting a book's position. All null unplaces the book."""
+    """Body for setting a book's position: a shelf slot, or a typed place in
+    other_location. All null unplaces the book."""
     shelf_id: Optional[int] = None
     shelf_column: Optional[int] = None
     shelf_row: Optional[int] = None
+    other_location: Optional[str] = None
 
 
 @app.put("/books/{book_id}/location", response_model=Book)
@@ -2675,12 +2738,26 @@ def set_book_location(book_id: int, loc: BookLocation, current_user: dict = Depe
     clobber fields the picker never loaded."""
     if not conn.execute("SELECT 1 FROM books WHERE id=?", (book_id,)).fetchone():
         raise HTTPException(status_code=404, detail="Not found")
-    shelf_id, column, row = resolve_location(loc.shelf_id, loc.shelf_column, loc.shelf_row)
-    conn.execute("UPDATE books SET shelf_id=?, shelf_column=?, shelf_row=? WHERE id=?",
-                 (shelf_id, column, row, book_id))
+    store_location(book_id,
+                   resolve_location(loc.shelf_id, loc.shelf_column, loc.shelf_row),
+                   clean_other_location(loc.other_location),
+                   other_sent=True)
     conn.commit()
     cur = conn.execute(f"SELECT {BOOK_COLUMNS} FROM books WHERE id=?", (book_id,))
     return book_from_row(cur.fetchone())
+
+
+@app.get("/other-locations", response_model=List[str])
+def list_other_locations(current_user: dict = Depends(get_current_user)):
+    """Every typed place in use, most-used first, so a picker can offer them
+    instead of making the user retype "Bedroom" each time."""
+    if is_guest(current_user) and not GUEST_SHELF_ACCESS_ENABLED:
+        raise HTTPException(status_code=403, detail="Shelf locations are private")
+    rows = conn.execute(
+        f"""SELECT other_location AS name, COUNT(*) AS n FROM books WHERE {HAS_OTHER_LOCATION}
+            GROUP BY other_location COLLATE NOCASE
+            ORDER BY n DESC, other_location COLLATE NOCASE""").fetchall()
+    return [r['name'] for r in rows]
 
 
 @app.post("/books/import")
