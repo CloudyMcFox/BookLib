@@ -198,6 +198,8 @@ button.danger:hover:not(:disabled){background:#b91c1c}
 .location-cell{display:flex;flex-direction:column;align-items:flex-start;gap:3px}
 .location-btn{display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:3px 7px;font-size:12px;max-width:130px}
 .location-btn.placed{background:#eef2ff;border-color:#dbe1fb}
+.location-mode{display:flex;gap:6px;margin-bottom:10px}
+.location-mode button{flex:1}
 .location-shelf{font-size:11px;color:#444;overflow:hidden;text-overflow:ellipsis;max-width:115px;white-space:nowrap}
 .location-coord{font-family:ui-monospace,Consolas,monospace;font-weight:600;color:#2563eb}
 .location-empty{color:#888}
